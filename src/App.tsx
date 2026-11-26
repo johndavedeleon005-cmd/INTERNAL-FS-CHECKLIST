@@ -31,16 +31,24 @@ import {
   createSampleInspection,
   formatReportNo,
 } from './data/checklistData';
-import { auth, signInWithGoogle, signOutUser } from './firebase';
+import {
+  auth,
+  extractFirebaseErrorDetails,
+  signInWithGoogle,
+  signOutUser,
+} from './firebase';
 import type {
   InspectionReport,
   ItemResponse,
   PdfExportOptions,
   PhotoProof,
+  PhotoUploadAttemptLog,
+  PhotoUploadDiagnostic,
   StoredPhotoRecord,
 } from './types/inspection';
 import {
   type CloudReportSummary,
+  autosaveReportDocumentOnline,
   clearCloudReportCache,
   deleteReportOnline,
   deleteSinglePhotoOnline,
@@ -71,6 +79,7 @@ import { InspectionSummaryView } from './components/InspectionSummaryView';
 import { JiangNanLogo } from './components/JiangNanLogo';
 import { NetworkStatusIndicator } from './components/NetworkStatusIndicator';
 import { PhotoLightbox } from './components/PhotoLightbox';
+import { PhotoUploadDiagnosticOverlay } from './components/PhotoUploadDiagnosticOverlay';
 import { PhotoVaultView } from './components/PhotoVaultView';
 import { ReportPreview } from './components/ReportPreview';
 import { ReportsLibraryView } from './components/ReportsLibraryView';
@@ -100,6 +109,14 @@ export default function App() {
   const [loadingCloudReports, setLoadingCloudReports] = useState(false);
   const [cloudPhotos, setCloudPhotos] = useState<StoredPhotoRecord[]>([]);
   const [isSavingOnline, setIsSavingOnline] = useState(false);
+  const [isAutoSaving, setIsAutoSaving] = useState(false);
+  const [autoSaveEnabled, setAutoSaveEnabled] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('iqaf005_autosave_enabled') !== 'false';
+    } catch {
+      return true;
+    }
+  });
   const [hasUnsavedCloudChanges, setHasUnsavedCloudChanges] = useState(false);
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [busyReportId, setBusyReportId] = useState<string | null>(null);
@@ -134,8 +151,16 @@ export default function App() {
   } | null>(null);
   const [emailReportTarget, setEmailReportTarget] =
     useState<InspectionReport | null>(null);
+  const [uploadDiagnostics, setUploadDiagnostics] = useState<
+    PhotoUploadDiagnostic[]
+  >([]);
+  const [diagnosticsOverlayOpen, setDiagnosticsOverlayOpen] = useState(false);
   const saveTimerRef = useRef<number | null>(null);
+  const cloudAutosaveTimerRef = useRef<number | null>(null);
+  const autoSaveInFlightRef = useRef<boolean>(false);
+  const editVersionRef = useRef<number>(0);
   const captionTimersRef = useRef<Map<string, number>>(new Map());
+  const uploadRunTokensRef = useRef<Map<string, number>>(new Map());
   const reportRef = useRef<InspectionReport>(report);
   reportRef.current = report;
 
@@ -256,6 +281,130 @@ export default function App() {
     };
   }, [report, isHydrated]);
 
+  const handleToggleAutoSave = (enabled: boolean) => {
+    setAutoSaveEnabled(enabled);
+    try {
+      localStorage.setItem('iqaf005_autosave_enabled', String(enabled));
+    } catch {
+      // ignore storage errors
+    }
+    showToast(enabled ? 'Auto-save enabled' : 'Auto-save paused');
+  };
+
+  const runCloudAutosave = async (targetUser: User) => {
+    if (
+      autoSaveInFlightRef.current ||
+      isSavingOnline ||
+      (typeof navigator !== 'undefined' && !navigator.onLine)
+    ) {
+      return;
+    }
+
+    const saveVersion = editVersionRef.current;
+    const snapshot: InspectionReport = {
+      ...reportRef.current,
+      updatedAt: new Date().toISOString(),
+    };
+
+    autoSaveInFlightRef.current = true;
+    setIsAutoSaving(true);
+
+    try {
+      await autosaveReportDocumentOnline(targetUser.uid, snapshot);
+      void saveReportSnapshotToDb(snapshot)
+        .then(() =>
+          setLocalReports((prev) => {
+            const filtered = prev.filter((r) => r.id !== snapshot.id);
+            return [snapshot, ...filtered];
+          })
+        )
+        .catch(() => {
+          // Ignore silent local history backup failure
+        });
+
+      setLastSyncedAt(new Date().toISOString());
+      if (editVersionRef.current === saveVersion) {
+        setHasUnsavedCloudChanges(false);
+      }
+    } catch (err) {
+      const details = extractFirebaseErrorDetails(err);
+      console.warn('[AutoSave] Deferred cloud autosave:', {
+        code: details.code,
+        message: details.rawMessage,
+      });
+      if (
+        details.code === 'resource-exhausted' ||
+        details.code === 'storage/quota-exceeded'
+      ) {
+        setStorageWarning(
+          'Daily Firestore quota reached — auto-save paused online while edits stay saved locally.'
+        );
+      }
+    } finally {
+      autoSaveInFlightRef.current = false;
+      setIsAutoSaving(false);
+    }
+  };
+
+  // Debounced online Firestore autosave whenever signed-in user edits the report
+  useEffect(() => {
+    if (
+      !isHydrated ||
+      !authReady ||
+      !user ||
+      !autoSaveEnabled ||
+      !hasUnsavedCloudChanges ||
+      isSavingOnline
+    ) {
+      return;
+    }
+
+    if (cloudAutosaveTimerRef.current) {
+      window.clearTimeout(cloudAutosaveTimerRef.current);
+    }
+
+    cloudAutosaveTimerRef.current = window.setTimeout(() => {
+      cloudAutosaveTimerRef.current = null;
+      void runCloudAutosave(user);
+    }, 2000);
+
+    return () => {
+      if (cloudAutosaveTimerRef.current) {
+        window.clearTimeout(cloudAutosaveTimerRef.current);
+        cloudAutosaveTimerRef.current = null;
+      }
+    };
+  }, [
+    report,
+    hasUnsavedCloudChanges,
+    autoSaveEnabled,
+    isHydrated,
+    authReady,
+    user,
+    isSavingOnline,
+  ]);
+
+  // Flush pending online autosave immediately if user switches tabs or minimizes
+  useEffect(() => {
+    if (!user || !autoSaveEnabled) return;
+    const handleVisibilityChange = () => {
+      if (
+        document.visibilityState === 'hidden' &&
+        hasUnsavedCloudChanges &&
+        !isSavingOnline
+      ) {
+        if (cloudAutosaveTimerRef.current) {
+          window.clearTimeout(cloudAutosaveTimerRef.current);
+          cloudAutosaveTimerRef.current = null;
+        }
+        void runCloudAutosave(user);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+    return () =>
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+  }, [user, autoSaveEnabled, hasUnsavedCloudChanges, isSavingOnline]);
+
   // Combine online cloud photos and local photos (cloud takes priority on matching IDs)
   const combinedStoredPhotos = useMemo(() => {
     const map = new Map<string, StoredPhotoRecord>();
@@ -355,6 +504,7 @@ export default function App() {
   const mutateReport = (
     updater: (prev: InspectionReport) => InspectionReport
   ) => {
+    editVersionRef.current += 1;
     setReport((prev) => updater(prev));
     setHasUnsavedCloudChanges(true);
   };
@@ -389,6 +539,51 @@ export default function App() {
     });
   };
 
+  const patchPhotoUploadFields = (
+    itemNumber: number,
+    photoId: string,
+    patch: Partial<PhotoProof>,
+    expectedReportIds?: string[],
+    nextReportId?: string
+  ) => {
+    const applyPatch = (prev: InspectionReport): InspectionReport => {
+      if (
+        expectedReportIds &&
+        expectedReportIds.length > 0 &&
+        !expectedReportIds.includes(prev.id)
+      ) {
+        return prev;
+      }
+      const current = prev.responses[itemNumber];
+      if (!current) return prev;
+      const targetId = patch.id ?? photoId;
+      let matched = false;
+      const nextPhotos = current.photos.map((p) => {
+        if (p.id === photoId || p.id === targetId) {
+          matched = true;
+          return { ...p, ...patch };
+        }
+        return p;
+      });
+      if (!matched) return prev;
+      return {
+        ...prev,
+        id: nextReportId ?? prev.id,
+        responses: {
+          ...prev.responses,
+          [itemNumber]: {
+            ...current,
+            photos: nextPhotos,
+          },
+        },
+      };
+    };
+
+    // Keep reportRef synchronously up to date so immediate retries never read stale error state
+    reportRef.current = applyPatch(reportRef.current);
+    setReport((prev) => applyPatch(prev));
+  };
+
   const uploadSinglePhotoTask = async (
     activeUser: User,
     snapshotReport: InspectionReport,
@@ -397,9 +592,79 @@ export default function App() {
   ): Promise<boolean> => {
     const MAX_ATTEMPTS = 3;
     const RETRY_DELAYS_MS = [700, 1800];
+    const runToken = (uploadRunTokensRef.current.get(photo.id) ?? 0) + 1;
+    uploadRunTokensRef.current.set(photo.id, runToken);
+
+    const isStaleRun = () =>
+      uploadRunTokensRef.current.get(photo.id) !== runToken;
+
+    const payloadBytes = photo.dataUrl ? photo.dataUrl.length : 0;
+    const attemptLogs: PhotoUploadAttemptLog[] = [];
     let lastErr: unknown = null;
 
+    // Guarantee uploadState cleanly resets to 'uploading' and clears previous error fields
+    // at the start of every initial upload and retry attempt.
+    patchPhotoUploadFields(
+      itemNumber,
+      photo.id,
+      {
+        uploadState: 'uploading',
+        uploadError: undefined,
+        uploadErrorCode: undefined,
+      },
+      [snapshotReport.id]
+    );
+    setUploadDiagnostics((prev) =>
+      prev.map((d) =>
+        d.photoId === photo.id ? { ...d, retrying: true } : d
+      )
+    );
+
+    console.info('[PhotoUpload] Starting upload task', {
+      runToken,
+      photoId: photo.id,
+      itemNumber,
+      reportId: snapshotReport.id,
+      fileName: photo.fileName,
+      payloadBytes,
+      uid: activeUser.uid,
+      emailVerified: activeUser.emailVerified,
+      online: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    });
+
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      if (isStaleRun()) {
+        console.info('[PhotoUpload] Superseded by newer retry run; exiting', {
+          runToken,
+          photoId: photo.id,
+        });
+        return false;
+      }
+
+      if (attempt > 0) {
+        // Re-assert clean uploading state on each automatic retry attempt
+        patchPhotoUploadFields(
+          itemNumber,
+          photo.id,
+          {
+            uploadState: 'uploading',
+            uploadError: undefined,
+            uploadErrorCode: undefined,
+          },
+          [snapshotReport.id]
+        );
+        console.info('[PhotoUpload] Retrying photo upload automatically', {
+          runToken,
+          photoId: photo.id,
+          itemNumber,
+          attempt: attempt + 1,
+          maxAttempts: MAX_ATTEMPTS,
+        });
+      }
+
+      const attemptStart =
+        typeof performance !== 'undefined' ? performance.now() : Date.now();
+
       try {
         const result = await uploadSinglePhotoImmediatelyOnline(
           activeUser.uid,
@@ -410,36 +675,45 @@ export default function App() {
           photo
         );
 
-        setReport((prev) => {
-          if (
-            prev.id !== snapshotReport.id &&
-            prev.id !== result.reportId
-          ) {
-            return prev;
+        if (isStaleRun()) {
+          return true;
+        }
+
+        const durationMs = Math.round(
+          (typeof performance !== 'undefined' ? performance.now() : Date.now()) -
+            attemptStart
+        );
+        console.info('[PhotoUpload] Upload succeeded', {
+          runToken,
+          photoId: result.photoId,
+          reportId: result.reportId,
+          itemNumber,
+          attempt: attempt + 1,
+          durationMs,
+        });
+
+        patchPhotoUploadFields(
+          itemNumber,
+          photo.id,
+          {
+            id: result.photoId,
+            dataUrl: result.safeDataUrl,
+            uploadState: 'synced',
+            uploadError: undefined,
+            uploadErrorCode: undefined,
+          },
+          [snapshotReport.id, result.reportId],
+          result.reportId
+        );
+
+        setUploadDiagnostics((prev) => {
+          const next = prev.filter(
+            (d) => d.photoId !== photo.id && d.photoId !== result.photoId
+          );
+          if (next.length === 0) {
+            setDiagnosticsOverlayOpen(false);
           }
-          const current = prev.responses[itemNumber];
-          if (!current) return prev;
-          return {
-            ...prev,
-            id: result.reportId,
-            responses: {
-              ...prev.responses,
-              [itemNumber]: {
-                ...current,
-                photos: current.photos.map((p) =>
-                  p.id === photo.id || p.id === result.photoId
-                    ? {
-                        ...p,
-                        id: result.photoId,
-                        dataUrl: result.safeDataUrl,
-                        uploadState: 'synced',
-                        uploadError: undefined,
-                      }
-                    : p
-                ),
-              },
-            },
-          };
+          return next;
         });
 
         setCloudPhotos((prev) => {
@@ -450,14 +724,34 @@ export default function App() {
         return true;
       } catch (err) {
         lastErr = err;
-        const errMsg = err instanceof Error ? err.message : String(err);
-        const nonRetryable =
-          errMsg.includes('Quota exceeded') ||
-          errMsg.includes('Invalid or corrupted') ||
-          errMsg.includes('600 KB') ||
-          errMsg.includes('storage limits');
+        const durationMs = Math.round(
+          (typeof performance !== 'undefined' ? performance.now() : Date.now()) -
+            attemptStart
+        );
+        const extracted = extractFirebaseErrorDetails(err);
+        attemptLogs.push({
+          attempt: attempt + 1,
+          timestamp: new Date().toISOString(),
+          durationMs,
+          errorCode: extracted.code,
+          message: extracted.rawMessage,
+        });
 
-        if (nonRetryable || attempt >= MAX_ATTEMPTS - 1) {
+        console.warn('[PhotoUpload] Attempt failed', {
+          runToken,
+          photoId: photo.id,
+          itemNumber,
+          attempt: attempt + 1,
+          maxAttempts: MAX_ATTEMPTS,
+          durationMs,
+          errorCode: extracted.code,
+          operationType: extracted.operationType,
+          path: extracted.path,
+          retryable: extracted.retryable,
+          rawMessage: extracted.rawMessage,
+        });
+
+        if (!extracted.retryable || attempt >= MAX_ATTEMPTS - 1) {
           break;
         }
         const delayMs = RETRY_DELAYS_MS[attempt] ?? 1500;
@@ -465,56 +759,72 @@ export default function App() {
       }
     }
 
-    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
-    const isQuota = msg.includes('Quota exceeded');
-    const isPermission =
-      msg.includes('permission-denied') ||
-      msg.includes('Missing or insufficient permissions');
-    const isOffline =
-      msg.includes('offline') ||
-      msg.includes('unavailable') ||
-      msg.includes('network') ||
-      (typeof navigator !== 'undefined' && !navigator.onLine);
-    const isTooLarge = msg.includes('600 KB') || msg.includes('storage limits');
+    if (isStaleRun()) {
+      return false;
+    }
 
-    if (isQuota) {
+    const finalDetails = extractFirebaseErrorDetails(lastErr);
+    const diagnosticEntry: PhotoUploadDiagnostic = {
+      id: `${photo.id}-${Date.now()}`,
+      photoId: photo.id,
+      reportId: snapshotReport.id,
+      itemNumber,
+      fileName: photo.fileName || `item-${itemNumber}.jpg`,
+      timestamp: new Date().toISOString(),
+      errorCode: finalDetails.code,
+      friendlySummary: finalDetails.friendlySummary,
+      guidance: finalDetails.guidance,
+      rawMessage: finalDetails.rawMessage,
+      operationType: finalDetails.operationType,
+      path:
+        finalDetails.path ||
+        `reports/${sanitizeId(snapshotReport.id, 'insp')}/photos/${sanitizeId(photo.id, 'ph')}`,
+      payloadBytes,
+      attempts: attemptLogs.length,
+      attemptLogs,
+      authState: {
+        signedIn: Boolean(activeUser),
+        uid: activeUser?.uid ?? null,
+        email: activeUser?.email ?? null,
+        emailVerified: activeUser?.emailVerified ?? null,
+      },
+      online: typeof navigator !== 'undefined' ? navigator.onLine : true,
+      retrying: false,
+    };
+
+    console.groupCollapsed(
+      `[PhotoUpload] FAILED (${finalDetails.code}) · Item #${itemNumber} · ${photo.id}`
+    );
+    console.error('Diagnostic summary:', diagnosticEntry);
+    console.error('Last raw error:', lastErr);
+    console.groupEnd();
+
+    if (
+      finalDetails.code === 'resource-exhausted' ||
+      finalDetails.code === 'storage/quota-exceeded'
+    ) {
       setStorageWarning(
-        'Daily Firestore free tier quota exceeded. Photo remains saved locally on this device.'
+        `Firebase quota exceeded (${finalDetails.code}). Photo remains saved locally on this device.`
       );
     }
 
-    const friendlyError = isQuota
-      ? 'Cloud quota exceeded'
-      : isTooLarge
-        ? 'Image too large to store'
-        : isOffline
-          ? 'Network offline — tap Retry'
-          : isPermission
-            ? 'Permission denied — sign in again'
-            : 'Upload failed — tap Retry';
+    patchPhotoUploadFields(
+      itemNumber,
+      photo.id,
+      {
+        uploadState: 'error',
+        uploadError: finalDetails.friendlySummary,
+        uploadErrorCode: finalDetails.code,
+      },
+      [snapshotReport.id]
+    );
 
-    setReport((prev) => {
-      const current = prev.responses[itemNumber];
-      if (!current) return prev;
-      return {
-        ...prev,
-        responses: {
-          ...prev.responses,
-          [itemNumber]: {
-            ...current,
-            photos: current.photos.map((p) =>
-              p.id === photo.id
-                ? {
-                    ...p,
-                    uploadState: 'error',
-                    uploadError: friendlyError,
-                  }
-                : p
-            ),
-          },
-        },
-      };
-    });
+    setUploadDiagnostics((prev) => [
+      diagnosticEntry,
+      ...prev.filter((d) => d.photoId !== photo.id),
+    ]);
+    setDiagnosticsOverlayOpen(true);
+
     return false;
   };
 
@@ -527,6 +837,7 @@ export default function App() {
       id: sanitizeId(ph.id, 'ph'),
       uploadState: activeUser ? 'uploading' : 'local',
       uploadError: undefined,
+      uploadErrorCode: undefined,
     }));
 
     const prevReport = reportRef.current;
@@ -578,7 +889,7 @@ export default function App() {
           );
         } else if (failed > 0) {
           showToast(
-            `${failed} ${failed === 1 ? 'photo' : 'photos'} failed to upload — tap Retry on the photo`
+            `${failed} ${failed === 1 ? 'photo' : 'photos'} failed to upload — see diagnostics panel`
           );
         }
       })();
@@ -597,36 +908,48 @@ export default function App() {
     }
     const current = reportRef.current.responses[itemNumber];
     const target = current?.photos.find((p) => p.id === photoId);
-    if (!target) return;
+    if (!target) {
+      console.warn('[PhotoUpload] Retry skipped — photo no longer in active report', {
+        itemNumber,
+        photoId,
+      });
+      setUploadDiagnostics((prev) => prev.filter((d) => d.photoId !== photoId));
+      return;
+    }
 
-    setReport((prev) => {
-      const resp = prev.responses[itemNumber];
-      if (!resp) return prev;
-      return {
-        ...prev,
-        responses: {
-          ...prev.responses,
-          [itemNumber]: {
-            ...resp,
-            photos: resp.photos.map((p) =>
-              p.id === photoId
-                ? { ...p, uploadState: 'uploading', uploadError: undefined }
-                : p
-            ),
-          },
-        },
-      };
+    console.info('[PhotoUpload] Manual retry requested', {
+      itemNumber,
+      photoId,
+      previousState: target.uploadState,
+      previousErrorCode: target.uploadErrorCode ?? null,
     });
 
-    void uploadSinglePhotoTask(user, reportRef.current, itemNumber, target).then(
-      (ok) => {
-        if (ok) {
-          showToast('Photo uploaded & saved online');
-        } else {
-          showToast('Retry failed — check your connection and try again');
-        }
+    const cleanTarget: PhotoProof = {
+      ...target,
+      uploadState: 'uploading',
+      uploadError: undefined,
+      uploadErrorCode: undefined,
+    };
+
+    // Reset state synchronously on both ref and React state before starting task
+    patchPhotoUploadFields(itemNumber, photoId, {
+      uploadState: 'uploading',
+      uploadError: undefined,
+      uploadErrorCode: undefined,
+    });
+
+    void uploadSinglePhotoTask(
+      user,
+      reportRef.current,
+      itemNumber,
+      cleanTarget
+    ).then((ok) => {
+      if (ok) {
+        showToast('Photo uploaded & saved online');
+      } else {
+        showToast('Retry failed — check diagnostic error code for details');
       }
-    );
+    });
   };
 
   const syncPendingOrFailedPhotos = (
@@ -647,23 +970,19 @@ export default function App() {
     }
     if (targets.length === 0) return;
 
-    const targetIds = new Set(targets.map((t) => t.photo.id));
-    setReport((prev) => {
-      const nextResponses = { ...prev.responses };
-      for (const { itemNumber } of targets) {
-        const resp = nextResponses[itemNumber];
-        if (!resp) continue;
-        nextResponses[itemNumber] = {
-          ...resp,
-          photos: resp.photos.map((p) =>
-            targetIds.has(p.id)
-              ? { ...p, uploadState: 'uploading', uploadError: undefined }
-              : p
-          ),
-        };
-      }
-      return { ...prev, responses: nextResponses };
+    console.info('[PhotoUpload] Batch sync/retry started', {
+      count: targets.length,
+      includeLocal,
+      photoIds: targets.map((t) => t.photo.id),
     });
+
+    for (const { itemNumber, photo } of targets) {
+      patchPhotoUploadFields(itemNumber, photo.id, {
+        uploadState: 'uploading',
+        uploadError: undefined,
+        uploadErrorCode: undefined,
+      });
+    }
 
     showToast(
       `Syncing ${targets.length} pending ${targets.length === 1 ? 'photo' : 'photos'} online…`
@@ -673,11 +992,17 @@ export default function App() {
       let okCount = 0;
       let failCount = 0;
       for (const { itemNumber, photo } of targets) {
+        const cleanPhoto: PhotoProof = {
+          ...photo,
+          uploadState: 'uploading',
+          uploadError: undefined,
+          uploadErrorCode: undefined,
+        };
         const ok = await uploadSinglePhotoTask(
           activeUser,
           reportRef.current,
           itemNumber,
-          photo
+          cleanPhoto
         );
         if (ok) okCount++;
         else failCount++;
@@ -688,7 +1013,7 @@ export default function App() {
         );
       } else if (failCount > 0) {
         showToast(
-          `${failCount} ${failCount === 1 ? 'photo' : 'photos'} still failed — tap Retry`
+          `${failCount} ${failCount === 1 ? 'photo' : 'photos'} still failed — see diagnostics panel`
         );
       }
     })();
@@ -752,6 +1077,8 @@ export default function App() {
     photoId: string
   ) => {
     const activeReportId = reportRef.current.id;
+    uploadRunTokensRef.current.delete(photoId);
+    setUploadDiagnostics((prev) => prev.filter((d) => d.photoId !== photoId));
     mutateReport((prev) => {
       const current = prev.responses[itemNumber] ?? createEmptyResponse();
       return {
@@ -787,6 +1114,12 @@ export default function App() {
   };
 
   const deleteStoredPhotoRecord = async (record: StoredPhotoRecord) => {
+    uploadRunTokensRef.current.delete(record.id);
+    setUploadDiagnostics((prev) => {
+      const next = prev.filter((d) => d.photoId !== record.id);
+      if (next.length === 0) setDiagnosticsOverlayOpen(false);
+      return next;
+    });
     mutateReport((prev) => {
       const current = prev.responses[record.itemNumber];
       if (!current || !current.photos.some((p) => p.id === record.id)) {
@@ -871,6 +1204,22 @@ export default function App() {
         setReport(savedOnline);
         setHasUnsavedCloudChanges(false);
         setLastSyncedAt(new Date().toISOString());
+        // Clear diagnostic entries for any photos that successfully synced during full save
+        const syncedPhotoIds = new Set<string>();
+        for (const resp of Object.values(savedOnline.responses)) {
+          for (const ph of resp.photos) {
+            if (ph.uploadState === 'synced') {
+              syncedPhotoIds.add(ph.id);
+            }
+          }
+        }
+        if (syncedPhotoIds.size > 0) {
+          setUploadDiagnostics((prev) => {
+            const next = prev.filter((d) => !syncedPhotoIds.has(d.photoId));
+            if (next.length === 0) setDiagnosticsOverlayOpen(false);
+            return next;
+          });
+        }
         // Refresh cloud photo vault
         const idsToLoad = Array.from(
           new Set([
@@ -1098,7 +1447,7 @@ export default function App() {
       fresh.signOffs.performedBy.printedName = user.displayName;
     }
     setReport(fresh);
-    setHasUnsavedCloudChanges(true);
+    setHasUnsavedCloudChanges(false);
     setActiveSectionCode('ALL');
     setFilterMode('all');
     setSearchQuery('');
@@ -1250,10 +1599,16 @@ export default function App() {
                 <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
                   {cloudReports.length} online{' '}
                   {cloudReports.length === 1 ? 'report' : 'reports'} ·{' '}
-                  {hasUnsavedCloudChanges ? (
+                  {isAutoSaving || isSavingOnline ? (
+                    <span className="text-amber-700 font-medium">
+                      Auto-saving…
+                    </span>
+                  ) : hasUnsavedCloudChanges ? (
                     <span className="text-amber-700 font-medium">Unsaved</span>
                   ) : (
-                    <span className="text-emerald-700 font-medium">Synced</span>
+                    <span className="text-emerald-700 font-medium">
+                      {autoSaveEnabled ? 'Auto-saved' : 'Synced'}
+                    </span>
                   )}
                 </div>
               </div>
@@ -1602,21 +1957,26 @@ export default function App() {
           <NetworkStatusIndicator
             isSignedIn={Boolean(user)}
             isSigningIn={isSigningIn}
-            isSavingOnline={isSavingOnline}
+            isSavingOnline={isSavingOnline || isAutoSaving}
             hasUnsavedCloudChanges={hasUnsavedCloudChanges}
             uploadingPhotoCount={photoSyncCounts.uploading}
             failedPhotoCount={photoSyncCounts.failed}
             localOnlyPhotoCount={photoSyncCounts.localOnly}
             totalPhotosCount={indexedPhotos.length}
             lastSyncedAt={lastSyncedAt}
+            autoSaveEnabled={autoSaveEnabled}
+            onToggleAutoSave={handleToggleAutoSave}
             onSaveOnline={handleSaveCurrentReport}
             onRetryFailedPhotos={retryAllFailedPhotos}
             onSignIn={handleSignIn}
             onConnectivityChange={(online) => {
               if (online) {
-                showToast('Connection restored — ready to sync online');
+                showToast('Connection restored — syncing online');
                 if (user) {
                   syncPendingOrFailedPhotos(user, true);
+                  if (autoSaveEnabled && hasUnsavedCloudChanges) {
+                    void runCloudAutosave(user);
+                  }
                 }
               } else {
                 showToast(
@@ -1813,6 +2173,7 @@ export default function App() {
               onInspectStoredPhoto={(record) =>
                 setLightboxState({ kind: 'stored', record })
               }
+              onShowUploadDiagnostics={() => setDiagnosticsOverlayOpen(true)}
             />
           ) : viewMode === 'report' ? (
             <ReportPreview
@@ -2224,6 +2585,9 @@ export default function App() {
                                   photoId: photo.id,
                                 })
                               }
+                              onShowUploadDiagnostics={() =>
+                                setDiagnosticsOverlayOpen(true)
+                              }
                             />
                           ))}
                         </div>
@@ -2547,6 +2911,28 @@ export default function App() {
           }
         />
       )}
+
+      {/* Photo Upload Failure Diagnostic Overlay */}
+      <PhotoUploadDiagnosticOverlay
+        diagnostics={uploadDiagnostics}
+        isOpen={diagnosticsOverlayOpen}
+        onToggleOpen={setDiagnosticsOverlayOpen}
+        onRetryPhoto={(itemNumber, photoId) =>
+          retryPhotoUpload(itemNumber, photoId)
+        }
+        onRetryAll={retryAllFailedPhotos}
+        onDismissEntry={(photoId) =>
+          setUploadDiagnostics((prev) => {
+            const next = prev.filter((d) => d.photoId !== photoId);
+            if (next.length === 0) setDiagnosticsOverlayOpen(false);
+            return next;
+          })
+        }
+        onClearAll={() => {
+          setUploadDiagnostics([]);
+          setDiagnosticsOverlayOpen(false);
+        }}
+      />
 
       {/* Quiet feedback toast */}
       {toastMessage && (

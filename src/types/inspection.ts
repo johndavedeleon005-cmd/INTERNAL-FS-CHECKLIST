@@ -11,6 +11,41 @@ export interface PhotoProof {
   takenAtSource?: 'camera' | 'exif' | 'file' | 'now';
   uploadState?: PhotoUploadState;
   uploadError?: string;
+  uploadErrorCode?: string;
+}
+
+export interface PhotoUploadAttemptLog {
+  attempt: number;
+  timestamp: string;
+  durationMs: number;
+  errorCode: string;
+  message: string;
+}
+
+export interface PhotoUploadDiagnostic {
+  id: string;
+  photoId: string;
+  reportId: string;
+  itemNumber: number;
+  fileName: string;
+  timestamp: string;
+  errorCode: string;
+  friendlySummary: string;
+  guidance: string;
+  rawMessage: string;
+  operationType: string | null;
+  path: string | null;
+  payloadBytes: number;
+  attempts: number;
+  attemptLogs: PhotoUploadAttemptLog[];
+  authState: {
+    signedIn: boolean;
+    uid: string | null;
+    email: string | null;
+    emailVerified: boolean | null;
+  };
+  online: boolean;
+  retrying?: boolean;
 }
 
 export interface ItemResponse {

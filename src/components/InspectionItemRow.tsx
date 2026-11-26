@@ -39,6 +39,7 @@ interface InspectionItemRowProps {
   onRemovePhoto: (photoId: string) => void;
   onUpdatePhotoCaption: (photoId: string, caption: string) => void;
   onInspectPhoto: (photo: PhotoProof) => void;
+  onShowUploadDiagnostics?: () => void;
 }
 
 const STATUS_OPTIONS: {
@@ -60,6 +61,7 @@ export function InspectionItemRow({
   onRemovePhoto,
   onUpdatePhotoCaption,
   onInspectPhoto,
+  onShowUploadDiagnostics,
 }: InspectionItemRowProps) {
   const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const [notesExpanded, setNotesExpanded] = useState(false);
@@ -415,10 +417,15 @@ export function InspectionItemRow({
                         </span>
                       )}
                       {photo.uploadState === 'error' && (
-                        <div className="flex items-center gap-2 text-red-700 font-medium">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-red-700 font-medium">
                           <span className="truncate">
                             {photo.uploadError || 'Upload failed'}
                           </span>
+                          {photo.uploadErrorCode && (
+                            <span className="font-mono text-[10px] px-1 py-0.5 rounded bg-red-100 text-red-800 shrink-0">
+                              {photo.uploadErrorCode}
+                            </span>
+                          )}
                           <button
                             type="button"
                             onClick={() => onRetryPhotoUpload(photo.id)}
@@ -427,6 +434,15 @@ export function InspectionItemRow({
                             <RotateCw className="w-3 h-3" />
                             Retry
                           </button>
+                          {onShowUploadDiagnostics && (
+                            <button
+                              type="button"
+                              onClick={onShowUploadDiagnostics}
+                              className="underline text-red-600 hover:text-red-900 shrink-0"
+                            >
+                              Details
+                            </button>
+                          )}
                         </div>
                       )}
                     </div>

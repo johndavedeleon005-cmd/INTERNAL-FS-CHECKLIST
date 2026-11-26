@@ -44,6 +44,7 @@ interface PhotoVaultViewProps {
   ) => void;
   onDeleteStoredPhoto: (record: StoredPhotoRecord) => void;
   onInspectStoredPhoto: (record: StoredPhotoRecord) => void;
+  onShowUploadDiagnostics?: () => void;
 }
 
 export function PhotoVaultView({
@@ -55,6 +56,7 @@ export function PhotoVaultView({
   onUpdateCurrentPhotoCaption,
   onDeleteStoredPhoto,
   onInspectStoredPhoto,
+  onShowUploadDiagnostics,
 }: PhotoVaultViewProps) {
   const [scope, setScope] = useState<'current' | 'all'>('all');
   const [searchQuery, setSearchQuery] = useState('');
@@ -433,10 +435,15 @@ export function PhotoVaultView({
                           </span>
                         )}
                         {uploadState === 'error' && (
-                          <span className="inline-flex items-center gap-2 text-red-700 font-medium">
+                          <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-0.5 text-red-700 font-medium">
                             <span className="truncate">
                               {currentPhoto?.uploadError || 'Upload failed'}
                             </span>
+                            {currentPhoto?.uploadErrorCode && (
+                              <span className="font-mono text-[10px] px-1 py-0.5 rounded bg-red-100 text-red-800 shrink-0">
+                                {currentPhoto.uploadErrorCode}
+                              </span>
+                            )}
                             <button
                               type="button"
                               onClick={() =>
@@ -447,6 +454,15 @@ export function PhotoVaultView({
                               <RotateCw className="w-3 h-3" />
                               Retry
                             </button>
+                            {onShowUploadDiagnostics && (
+                              <button
+                                type="button"
+                                onClick={onShowUploadDiagnostics}
+                                className="underline text-red-600 hover:text-red-900 shrink-0"
+                              >
+                                Details
+                              </button>
+                            )}
                           </span>
                         )}
                       </div>

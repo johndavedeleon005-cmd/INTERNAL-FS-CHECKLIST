@@ -250,9 +250,16 @@ export function uploadSinglePhotoImmediatelyOnline(
     const reportPath = `reports/${safeReportId}`;
     const reportRef = doc(db, 'reports', safeReportId);
 
+    const startMs = Date.now();
     // Ensure valid, <= 500KB JPEG dataUrl (never corrupt base64 by truncating)
     const safeDataUrl = await ensureSafePhotoDataUrl(photo.dataUrl);
     if (!safeDataUrl || safeDataUrl.length > 600000) {
+      console.error('[PhotoUpload] Payload rejected before write', {
+        reportId: safeReportId,
+        photoId: photo.id,
+        itemNumber,
+        payloadChars: safeDataUrl?.length ?? 0,
+      });
       throw new Error('Photo exceeds the maximum 600 KB storage limit.');
     }
 
@@ -279,7 +286,9 @@ export function uploadSinglePhotoImmediatelyOnline(
         exists = snap.exists();
       } catch (error) {
         const msg = error instanceof Error ? error.message : String(error);
+        const code = (error as { code?: string })?.code ?? '';
         if (
+          code !== 'permission-denied' &&
           !msg.includes('permission-denied') &&
           !msg.includes('Missing or insufficient permissions')
         ) {
@@ -288,6 +297,10 @@ export function uploadSinglePhotoImmediatelyOnline(
       }
 
       if (!exists) {
+        console.info('[PhotoUpload] Creating parent report before photo write', {
+          reportPath,
+          uid,
+        });
         const initialFields = buildCommonReportFields(report);
         try {
           await setDoc(reportRef, {
@@ -357,15 +370,30 @@ export function uploadSinglePhotoImmediatelyOnline(
     // Step 2: Directly write photo document without downloading all previous photos first.
     // If setDoc hits permission-denied on an existing doc (e.g., retry) or a deleted parent,
     // recover cleanly via updateDoc or re-creating the parent report.
+    console.info('[PhotoUpload] Writing photo document', {
+      photoPath,
+      itemNumber,
+      payloadChars: safeDataUrl.length,
+    });
     try {
       await setDoc(photoRef, createPayload);
     } catch (firstErr) {
       const msg =
         firstErr instanceof Error ? firstErr.message : String(firstErr);
+      const errCode = (firstErr as { code?: string })?.code ?? 'unknown';
       const isPermOrExists =
+        errCode === 'permission-denied' ||
+        errCode === 'already-exists' ||
         msg.includes('permission-denied') ||
         msg.includes('Missing or insufficient permissions') ||
         msg.includes('already-exists');
+
+      console.warn('[PhotoUpload] Initial setDoc failed', {
+        photoPath,
+        errCode,
+        isPermOrExists,
+        msg,
+      });
 
       if (!isPermOrExists) {
         handleFirestoreError(firstErr, OperationType.CREATE, photoPath);
@@ -374,7 +402,17 @@ export function uploadSinglePhotoImmediatelyOnline(
       // First try updating in case the photo document already exists (e.g., retry after timeout)
       try {
         await updateDoc(photoRef, updatePayload);
-      } catch {
+        console.info('[PhotoUpload] Recovered via updateDoc on existing photo', {
+          photoPath,
+        });
+      } catch (updateErr) {
+        console.warn(
+          '[PhotoUpload] updateDoc recovery failed, re-ensuring parent report',
+          {
+            photoPath,
+            updateErrCode: (updateErr as { code?: string })?.code ?? 'unknown',
+          }
+        );
         // Otherwise parent report may have been deleted remotely; re-ensure parent and create once
         ensuredReportIds.delete(cacheKey);
         await ensureParentReport();
@@ -394,8 +432,14 @@ export function uploadSinglePhotoImmediatelyOnline(
         updatedAt: serverTimestamp(),
       });
     } catch (statsErr) {
-      console.warn('Non-fatal photoCount sync warning:', statsErr);
+      console.warn('[PhotoUpload] Non-fatal photoCount sync warning:', statsErr);
     }
+
+    console.info('[PhotoUpload] Completed online photo upload', {
+      photoPath,
+      itemNumber,
+      elapsedMs: Date.now() - startMs,
+    });
 
     const storedRecord: StoredPhotoRecord = {
       id: safePhotoId,
@@ -443,6 +487,91 @@ export function updatePhotoCaptionOnline(
     } catch (error) {
       handleFirestoreError(error, OperationType.UPDATE, photoPath);
     }
+  });
+}
+
+/**
+ * Lightweight, quota-safe online autosave for the parent `/reports/{reportId}` document.
+ * Writes ONLY the report metadata, responses, sign-offs, and stats (no photo subcollection
+ * reads/rewrites, since photos upload immediately when captured or selected).
+ */
+export function autosaveReportDocumentOnline(
+  uid: string,
+  report: InspectionReport
+): Promise<{ reportId: string; updatedAt: string }> {
+  const safeReportId = sanitizeId(report.id, 'insp');
+  return enqueueReportWrite(safeReportId, async () => {
+    const reportPath = `reports/${safeReportId}`;
+    const reportRef = doc(db, 'reports', safeReportId);
+    const commonFields = buildCommonReportFields(report);
+    const cacheKey = `${uid}:${safeReportId}`;
+
+    // Fast path: if report is already known to exist in Firestore, do a single updateDoc (0 reads, 1 write)
+    if (ensuredReportIds.has(cacheKey)) {
+      try {
+        await updateDoc(reportRef, {
+          ...commonFields,
+          updatedAt: serverTimestamp(),
+        });
+        return {
+          reportId: safeReportId,
+          updatedAt: new Date().toISOString(),
+        };
+      } catch (err) {
+        const code = (err as { code?: string })?.code ?? '';
+        const msg = err instanceof Error ? err.message : String(err);
+        // Only fall through to existence check + create if the doc was deleted remotely
+        if (code !== 'not-found' && !msg.includes('No document to update')) {
+          handleFirestoreError(err, OperationType.UPDATE, reportPath);
+        }
+        ensuredReportIds.delete(cacheKey);
+      }
+    }
+
+    let existsOnline = false;
+    try {
+      const existingSnap = await getDoc(reportRef);
+      existsOnline = existingSnap.exists();
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      const code = (error as { code?: string })?.code ?? '';
+      if (
+        code !== 'permission-denied' &&
+        !msg.includes('permission-denied') &&
+        !msg.includes('Missing or insufficient permissions')
+      ) {
+        handleFirestoreError(error, OperationType.GET, reportPath);
+      }
+      existsOnline = false;
+    }
+
+    if (existsOnline) {
+      try {
+        await updateDoc(reportRef, {
+          ...commonFields,
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.UPDATE, reportPath);
+      }
+    } else {
+      try {
+        await setDoc(reportRef, {
+          ownerId: uid,
+          ...commonFields,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } catch (error) {
+        handleFirestoreError(error, OperationType.CREATE, reportPath);
+      }
+    }
+
+    ensuredReportIds.add(cacheKey);
+    return {
+      reportId: safeReportId,
+      updatedAt: new Date().toISOString(),
+    };
   });
 }
 

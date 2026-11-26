@@ -1,11 +1,12 @@
 {
-  "projectId": "gen-lang-client-0275880319",
-  "appId": "1:693656538701:web:da8f9df07688ca09fb5604",
-  "apiKey": "AIzaSyDQon3O6dSYipqHxq-7NlulBPBwf_A_nN8",
-  "authDomain": "gen-lang-client-0275880319.firebaseapp.com",
-  "storageBucket": "gen-lang-client-0275880319.firebasestorage.app",
-  "messagingSenderId": "693656538701",
+  "projectId": "commanding-gearbox-5w2pc",
+  "appId": "1:180024325782:web:ca7917a562a29e01dff4b7",
+  "apiKey": "AIzaSyDAD7rLb5ovk6jW3bHsfJJ72_QuXmW2l44",
+  "authDomain": "commanding-gearbox-5w2pc.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-iqaf005storeinsp-4ca48860-6d7e-4f5e-aaea-2fe11e10e857",
+  "storageBucket": "commanding-gearbox-5w2pc.firebasestorage.app",
+  "messagingSenderId": "180024325782",
   "measurementId": "",
-  "oAuthClientId": "693656538701-a9lu1vfq6ph1dht8vlf9328724s49dd5.apps.googleusercontent.com",
+  "oAuthClientId": "180024325782-fbgshg3ll792l2dt858lhf9a8dl5po1u.apps.googleusercontent.com",
   "recaptchaSiteKey": ""
 }
