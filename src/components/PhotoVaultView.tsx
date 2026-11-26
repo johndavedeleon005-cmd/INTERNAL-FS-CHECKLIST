@@ -27,6 +27,7 @@ import {
   compressImageFile,
   extractPhotoTakenTimestamp,
   formatTakenTimestamp,
+  generatePhotoId,
   isSupportedImageFile,
 } from '../utils/imageUtils';
 
@@ -150,7 +151,7 @@ export function PhotoVaultView({
             extractPhotoTakenTimestamp(file, false),
           ]);
           added.push({
-            id: `ph-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            id: generatePhotoId(),
             dataUrl,
             caption: '',
             capturedAt: taken.iso,
@@ -433,13 +434,15 @@ export function PhotoVaultView({
                         )}
                         {uploadState === 'error' && (
                           <span className="inline-flex items-center gap-2 text-red-700 font-medium">
-                            <span>Upload failed</span>
+                            <span className="truncate">
+                              {currentPhoto?.uploadError || 'Upload failed'}
+                            </span>
                             <button
                               type="button"
                               onClick={() =>
                                 onRetryPhotoUpload(rec.itemNumber, rec.id)
                               }
-                              className="inline-flex items-center gap-1 underline hover:text-red-900"
+                              className="inline-flex items-center gap-1 underline hover:text-red-900 shrink-0"
                             >
                               <RotateCw className="w-3 h-3" />
                               Retry

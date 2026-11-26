@@ -71,13 +71,15 @@ export function NetworkStatusIndicator({
     const timeoutId = window.setTimeout(() => controller.abort(), 4500);
 
     try {
-      const res = await fetch('/api/health', {
+      const res = await fetch(`${import.meta.env.BASE_URL}api/health`, {
         method: 'GET',
         cache: 'no-store',
         signal: controller.signal,
       });
       setBrowserOnline(true);
-      setServerReachable(res.ok);
+      // On static hosts (e.g., GitHub Pages) there is no Express /api/health endpoint,
+      // so the host responds with HTTP 404. Any non-5xx HTTP response confirms the network is up.
+      setServerReachable(res.ok || res.status === 404);
     } catch {
       setServerReachable(false);
     } finally {

@@ -53,6 +53,12 @@ const VALID_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
 
 // Per-report async queue to prevent concurrent Master Gate / photoCount race conditions
 const reportWriteQueues = new Map<string, Promise<unknown>>();
+// Cache of `${uid}:${reportId}` pairs confirmed to exist in Firestore
+const ensuredReportIds = new Set<string>();
+
+export function clearCloudReportCache(): void {
+  ensuredReportIds.clear();
+}
 
 function enqueueReportWrite<T>(
   reportId: string,
@@ -265,50 +271,43 @@ export function uploadSinglePhotoImmediatelyOnline(
     }
 
     // Step 1: Ensure parent report exists in Firestore before subcollection write
-    let existingReportData: Record<string, unknown> | null = null;
-    try {
-      const snap = await getDoc(reportRef);
-      if (snap.exists()) {
-        existingReportData = snap.data() as Record<string, unknown>;
-      }
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      if (
-        !msg.includes('permission-denied') &&
-        !msg.includes('Missing or insufficient permissions')
-      ) {
-        handleFirestoreError(error, OperationType.GET, reportPath);
-      }
-    }
-
-    if (!existingReportData) {
-      const initialFields = buildCommonReportFields(report);
+    const cacheKey = `${uid}:${safeReportId}`;
+    const ensureParentReport = async () => {
+      let exists = false;
       try {
-        await setDoc(reportRef, {
-          ownerId: uid,
-          ...initialFields,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+        const snap = await getDoc(reportRef);
+        exists = snap.exists();
       } catch (error) {
-        handleFirestoreError(error, OperationType.CREATE, reportPath);
+        const msg = error instanceof Error ? error.message : String(error);
+        if (
+          !msg.includes('permission-denied') &&
+          !msg.includes('Missing or insufficient permissions')
+        ) {
+          handleFirestoreError(error, OperationType.GET, reportPath);
+        }
       }
+
+      if (!exists) {
+        const initialFields = buildCommonReportFields(report);
+        try {
+          await setDoc(reportRef, {
+            ownerId: uid,
+            ...initialFields,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        } catch (error) {
+          handleFirestoreError(error, OperationType.CREATE, reportPath);
+        }
+      }
+      ensuredReportIds.add(cacheKey);
+    };
+
+    if (!ensuredReportIds.has(cacheKey)) {
+      await ensureParentReport();
     }
 
-    // Step 2: Check existing photos in subcollection (avoids getDoc permission-denied on non-existent photo)
     const photosColPath = `reports/${safeReportId}/photos`;
-    const existingPhotoIds = new Set<string>();
-    try {
-      const existingPhotosSnap = await getDocs(
-        query(collection(db, photosColPath), where('ownerId', '==', uid))
-      );
-      for (const d of existingPhotosSnap.docs) {
-        existingPhotoIds.add(d.id);
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.LIST, photosColPath);
-    }
-
     const safePhotoId = sanitizeId(photo.id, 'ph');
     const photoPath = `${photosColPath}/${safePhotoId}`;
     const photoRef = doc(db, photosColPath, safePhotoId);
@@ -323,56 +322,79 @@ export function uploadSinglePhotoImmediatelyOnline(
       photo.fileName || `item-${itemNumber}.jpg`,
       200
     );
+    const caption = clampString(photo.caption, 500);
+    const complied = sanitizeComplied(resp.complied);
+    const deviation = clampString(resp.deviation, 2000);
 
-    // Step 3: Create or update the photo document (strictly 16 schema keys only!)
-    if (existingPhotoIds.has(safePhotoId)) {
-      try {
-        await updateDoc(photoRef, {
-          caption: clampString(photo.caption, 500),
-          complied: sanitizeComplied(resp.complied),
-          deviation: clampString(resp.deviation, 2000),
-          storeLocation,
-          inspectionDate,
-          updatedAt: serverTimestamp(),
-        });
-      } catch (error) {
-        handleFirestoreError(error, OperationType.UPDATE, photoPath);
+    const createPayload = {
+      ownerId: uid,
+      reportId: safeReportId,
+      itemNumber,
+      sectionCode: clampString(sectionCode, 4),
+      sectionTitle: clampString(sectionTitle, 120),
+      itemText: clampString(itemText, 400),
+      complied,
+      deviation,
+      caption,
+      fileName,
+      storeLocation,
+      inspectionDate,
+      dataUrl: safeDataUrl,
+      capturedAt,
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    };
+
+    const updatePayload = {
+      caption,
+      complied,
+      deviation,
+      storeLocation,
+      inspectionDate,
+      updatedAt: serverTimestamp(),
+    };
+
+    // Step 2: Directly write photo document without downloading all previous photos first.
+    // If setDoc hits permission-denied on an existing doc (e.g., retry) or a deleted parent,
+    // recover cleanly via updateDoc or re-creating the parent report.
+    try {
+      await setDoc(photoRef, createPayload);
+    } catch (firstErr) {
+      const msg =
+        firstErr instanceof Error ? firstErr.message : String(firstErr);
+      const isPermOrExists =
+        msg.includes('permission-denied') ||
+        msg.includes('Missing or insufficient permissions') ||
+        msg.includes('already-exists');
+
+      if (!isPermOrExists) {
+        handleFirestoreError(firstErr, OperationType.CREATE, photoPath);
       }
-    } else {
+
+      // First try updating in case the photo document already exists (e.g., retry after timeout)
       try {
-        await setDoc(photoRef, {
-          ownerId: uid,
-          reportId: safeReportId,
-          itemNumber,
-          sectionCode: clampString(sectionCode, 4),
-          sectionTitle: clampString(sectionTitle, 120),
-          itemText: clampString(itemText, 400),
-          complied: sanitizeComplied(resp.complied),
-          deviation: clampString(resp.deviation, 2000),
-          caption: clampString(photo.caption, 500),
-          fileName,
-          storeLocation,
-          inspectionDate,
-          dataUrl: safeDataUrl,
-          capturedAt,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-        existingPhotoIds.add(safePhotoId);
-      } catch (error) {
-        handleFirestoreError(error, OperationType.CREATE, photoPath);
+        await updateDoc(photoRef, updatePayload);
+      } catch {
+        // Otherwise parent report may have been deleted remotely; re-ensure parent and create once
+        ensuredReportIds.delete(cacheKey);
+        await ensureParentReport();
+        try {
+          await setDoc(photoRef, createPayload);
+        } catch (retryErr) {
+          handleFirestoreError(retryErr, OperationType.CREATE, photoPath);
+        }
       }
     }
 
-    // Step 4: Update parent report's photoCount stat cleanly (Action 2 in firestore.rules)
+    // Step 3: Best-effort update of parent report's photoCount stat (never fail an already-uploaded photo)
     try {
-      const liveStats = computeStats(report, existingPhotoIds.size);
+      const liveStats = computeStats(report);
       await updateDoc(reportRef, {
         stats: liveStats,
         updatedAt: serverTimestamp(),
       });
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, reportPath);
+    } catch (statsErr) {
+      console.warn('Non-fatal photoCount sync warning:', statsErr);
     }
 
     const storedRecord: StoredPhotoRecord = {
@@ -474,6 +496,7 @@ export function saveReportOnline(
         handleFirestoreError(error, OperationType.CREATE, reportPath);
       }
     }
+    ensuredReportIds.add(`${uid}:${safeReportId}`);
 
     // Now sync photos subcollection (parent report guaranteed to exist for Master Gate!)
     const photosColPath = `reports/${safeReportId}/photos`;
@@ -790,6 +813,7 @@ export function deleteReportOnline(
     const reportPath = `reports/${safeReportId}`;
     try {
       await deleteDoc(doc(db, 'reports', safeReportId));
+      ensuredReportIds.delete(`${uid}:${safeReportId}`);
     } catch (error) {
       handleFirestoreError(error, OperationType.DELETE, reportPath);
     }
@@ -814,8 +838,7 @@ export function deleteSinglePhotoOnline(
       handleFirestoreError(error, OperationType.DELETE, photoPath);
     }
 
-    // Re-sync parent photoCount cleanly
-    const reportPath = `reports/${safeReportId}`;
+    // Re-sync parent photoCount cleanly (best-effort)
     try {
       const reportSnap = await getDoc(doc(db, 'reports', safeReportId));
       if (reportSnap.exists()) {
@@ -843,8 +866,8 @@ export function deleteSinglePhotoOnline(
           updatedAt: serverTimestamp(),
         });
       }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.UPDATE, reportPath);
+    } catch (statsErr) {
+      console.warn('Non-fatal delete photoCount sync warning:', statsErr);
     }
   });
 }

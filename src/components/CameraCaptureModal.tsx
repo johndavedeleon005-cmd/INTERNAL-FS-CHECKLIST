@@ -3,6 +3,7 @@ import {
   Camera,
   Check,
   Clock,
+  Loader2,
   RefreshCw,
   RotateCcw,
   Upload,
@@ -10,10 +11,11 @@ import {
 } from 'lucide-react';
 import type { PhotoProof } from '../types/inspection';
 import {
-  compressCanvasToDataUrl,
+  compressDrawableToDataUrl,
   compressImageFile,
   extractPhotoTakenTimestamp,
   formatTakenTimestamp,
+  generatePhotoId,
 } from '../utils/imageUtils';
 
 interface CameraCaptureModalProps {
@@ -38,6 +40,8 @@ export function CameraCaptureModal({
   );
   const [cameraError, setCameraError] = useState<string | null>(null);
   const [isStarting, setIsStarting] = useState(true);
+  const [isVideoReady, setIsVideoReady] = useState(false);
+  const [isProcessingNativePhoto, setIsProcessingNativePhoto] = useState(false);
   const [liveClock, setLiveClock] = useState(() => new Date().toISOString());
 
   const [capturedPreview, setCapturedPreview] = useState<{
@@ -69,6 +73,7 @@ export function CameraCaptureModal({
 
     let cancelled = false;
     setIsStarting(true);
+    setIsVideoReady(false);
     setCameraError(null);
 
     const stopStream = () => {
@@ -128,26 +133,39 @@ export function CameraCaptureModal({
 
   const handleTakePhoto = () => {
     const video = videoRef.current;
-    if (!video || !video.videoWidth || !video.videoHeight) return;
-
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const dataUrl = compressCanvasToDataUrl(canvas);
-    const capturedAt = new Date().toISOString();
-
-    if (streamRef.current) {
-      for (const track of streamRef.current.getTracks()) {
-        track.stop();
-      }
-      streamRef.current = null;
+    if (
+      !video ||
+      video.readyState < 2 ||
+      !video.videoWidth ||
+      !video.videoHeight
+    ) {
+      setCameraError(
+        'Camera preview is still initializing. Wait a moment or tap Device Camera.'
+      );
+      return;
     }
 
-    setCapturedPreview({ dataUrl, capturedAt });
+    try {
+      const dataUrl = compressDrawableToDataUrl(
+        video,
+        video.videoWidth,
+        video.videoHeight
+      );
+      const capturedAt = new Date().toISOString();
+
+      if (streamRef.current) {
+        for (const track of streamRef.current.getTracks()) {
+          track.stop();
+        }
+        streamRef.current = null;
+      }
+
+      setCapturedPreview({ dataUrl, capturedAt });
+    } catch {
+      setCameraError(
+        'Could not capture video frame. Try again or use Device Camera.'
+      );
+    }
   };
 
   const handleNativeCameraFallback = async (
@@ -155,13 +173,15 @@ export function CameraCaptureModal({
   ) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    setIsProcessingNativePhoto(true);
+    setCameraError(null);
     try {
       const [dataUrl, taken] = await Promise.all([
         compressImageFile(file),
         extractPhotoTakenTimestamp(file, true),
       ]);
       onCaptureComplete({
-        id: `ph-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        id: generatePhotoId(),
         dataUrl,
         caption: caption.trim(),
         capturedAt: taken.iso,
@@ -169,9 +189,14 @@ export function CameraCaptureModal({
         fileName: file.name || `camera-item-${itemNumber}.jpg`,
       });
       onClose();
-    } catch {
-      setCameraError('Could not process photo from device camera.');
+    } catch (err) {
+      setCameraError(
+        err instanceof Error && err.message
+          ? err.message
+          : 'Could not process photo from device camera.'
+      );
     } finally {
+      setIsProcessingNativePhoto(false);
       if (nativeCameraInputRef.current) {
         nativeCameraInputRef.current.value = '';
       }
@@ -184,7 +209,7 @@ export function CameraCaptureModal({
       .replace(/[^0-9]/g, '')
       .slice(0, 14);
     onCaptureComplete({
-      id: `ph-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      id: generatePhotoId(),
       dataUrl: capturedPreview.dataUrl,
       caption: caption.trim(),
       capturedAt: capturedPreview.capturedAt,
@@ -257,11 +282,18 @@ export function CameraCaptureModal({
                 playsInline
                 muted
                 autoPlay
+                onLoadedMetadata={() => setIsVideoReady(true)}
+                onPlaying={() => setIsVideoReady(true)}
                 className="w-full h-full object-cover"
               />
-              {isStarting && (
-                <div className="absolute inset-0 bg-slate-950/70 flex items-center justify-center text-xs text-slate-200">
-                  Starting camera…
+              {(isStarting || isProcessingNativePhoto) && (
+                <div className="absolute inset-0 bg-slate-950/70 flex items-center justify-center gap-2 text-xs text-slate-200">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>
+                    {isProcessingNativePhoto
+                      ? 'Preparing photo for upload…'
+                      : 'Starting camera…'}
+                  </span>
                 </div>
               )}
             </>
@@ -346,7 +378,12 @@ export function CameraCaptureModal({
               <button
                 type="button"
                 onClick={handleTakePhoto}
-                disabled={isStarting || Boolean(cameraError)}
+                disabled={
+                  isStarting ||
+                  !isVideoReady ||
+                  isProcessingNativePhoto ||
+                  Boolean(cameraError)
+                }
                 className="inline-flex items-center gap-2 px-5 h-10 text-xs font-semibold text-white bg-red-700 hover:bg-red-800 disabled:opacity-40 rounded-lg transition-colors whitespace-nowrap"
               >
                 <Camera className="w-4 h-4" />
@@ -355,10 +392,18 @@ export function CameraCaptureModal({
 
               <button
                 type="button"
+                disabled={isProcessingNativePhoto}
                 onClick={() => nativeCameraInputRef.current?.click()}
-                className="inline-flex items-center gap-1.5 px-3 h-9 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 hover:bg-slate-100 rounded-lg transition-colors whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-3 h-9 text-xs font-medium text-slate-700 bg-slate-50 border border-slate-200 hover:bg-slate-100 disabled:opacity-50 rounded-lg transition-colors whitespace-nowrap"
               >
-                Device Camera
+                {isProcessingNativePhoto ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Processing…
+                  </>
+                ) : (
+                  'Device Camera'
+                )}
               </button>
             </div>
           )}

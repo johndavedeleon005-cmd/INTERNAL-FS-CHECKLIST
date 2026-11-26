@@ -25,6 +25,7 @@ import {
   compressImageFile,
   extractPhotoTakenTimestamp,
   formatTakenTimestamp,
+  generatePhotoId,
   isSupportedImageFile,
 } from '../utils/imageUtils';
 
@@ -106,7 +107,7 @@ export function InspectionItemRow({
             extractPhotoTakenTimestamp(file, false),
           ]);
           added.push({
-            id: `ph-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            id: generatePhotoId(),
             dataUrl,
             caption: '',
             capturedAt: taken.iso,

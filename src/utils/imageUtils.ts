@@ -3,11 +3,28 @@ const MAX_SAFE_DATAURL_CHARS = 500000;
 const IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|gif|bmp|heic|heif|avif)$/i;
 
 /**
- * Checks whether a File is likely an image even if mobile browsers omit file.type.
+ * Generates a collision-proof photo ID valid for Firestore document IDs.
+ */
+export function generatePhotoId(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return `ph-${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
+  }
+  return `ph-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/**
+ * Checks whether a File is likely an image even when mobile galleries (Android/iOS)
+ * omit file.type or pass application/octet-stream with extensionless filenames.
  */
 export function isSupportedImageFile(file: File): boolean {
-  if (file.type && file.type.startsWith('image/')) return true;
-  if (!file.type && file.name && IMAGE_EXTENSIONS.test(file.name)) return true;
+  const mime = (file.type || '').toLowerCase().trim();
+  if (mime.startsWith('image/')) return true;
+  if (!mime || mime === 'application/octet-stream') {
+    // Allow extensionless mobile gallery photos to be decoded directly;
+    // reject obviously non-image extensions if one is present.
+    if (!file.name || !file.name.includes('.')) return true;
+    return IMAGE_EXTENSIONS.test(file.name);
+  }
   return false;
 }
 
@@ -172,13 +189,28 @@ export async function extractPhotoTakenTimestamp(
   return { iso: new Date().toISOString(), source: 'now' };
 }
 
+function isValidImageDataUrl(dataUrl: string): boolean {
+  return (
+    typeof dataUrl === 'string' &&
+    dataUrl.startsWith('data:image/') &&
+    dataUrl.includes(';base64,') &&
+    dataUrl.length > 100
+  );
+}
+
 /**
- * Compresses an HTMLCanvasElement into a guaranteed <= 500KB JPEG data URL
- * suitable for Firestore subcollection storage and PDF embedding.
+ * Directly scales any drawable source (ImageBitmap, HTMLImageElement, HTMLVideoElement,
+ * or HTMLCanvasElement) down to <= 960px on the VERY FIRST canvas draw to avoid
+ * mobile Safari/Chrome 16.7MP canvas memory limits, and compresses to <= 500KB JPEG.
  */
-export function compressCanvasToDataUrl(
-  sourceCanvas: HTMLCanvasElement
+export function compressDrawableToDataUrl(
+  source: CanvasImageSource,
+  srcWidth: number,
+  srcHeight: number
 ): string {
+  const safeSrcW = Math.max(1, Math.round(srcWidth || 640));
+  const safeSrcH = Math.max(1, Math.round(srcHeight || 480));
+
   const steps: [number, number][] = [
     [960, 0.78],
     [820, 0.72],
@@ -186,11 +218,14 @@ export function compressCanvasToDataUrl(
     [540, 0.58],
     [420, 0.52],
     [320, 0.48],
+    [260, 0.42],
   ];
 
+  const out = document.createElement('canvas');
+
   for (const [maxDim, quality] of steps) {
-    let width = sourceCanvas.width;
-    let height = sourceCanvas.height;
+    let width = safeSrcW;
+    let height = safeSrcH;
     if (width > maxDim || height > maxDim) {
       if (width >= height) {
         height = Math.max(1, Math.round((height * maxDim) / width));
@@ -201,138 +236,149 @@ export function compressCanvasToDataUrl(
       }
     }
 
-    const out = document.createElement('canvas');
     out.width = width;
     out.height = height;
     const ctx = out.getContext('2d');
     if (!ctx) continue;
+
     ctx.fillStyle = '#FFFFFF';
     ctx.fillRect(0, 0, width, height);
-    ctx.drawImage(sourceCanvas, 0, 0, width, height);
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(source, 0, 0, width, height);
 
     const dataUrl = out.toDataURL('image/jpeg', quality);
-    if (dataUrl.length <= MAX_SAFE_DATAURL_CHARS) {
+    if (isValidImageDataUrl(dataUrl) && dataUrl.length <= MAX_SAFE_DATAURL_CHARS) {
+      // Release backing store memory promptly on mobile devices
+      out.width = 0;
+      out.height = 0;
       return dataUrl;
     }
   }
 
-  // Final safety floor
-  const tiny = document.createElement('canvas');
-  tiny.width = 280;
-  tiny.height = Math.max(
-    1,
-    Math.round((sourceCanvas.height * 280) / Math.max(1, sourceCanvas.width))
+  out.width = 0;
+  out.height = 0;
+  throw new Error('Could not compress image within storage limits.');
+}
+
+/**
+ * Compresses an HTMLCanvasElement into a guaranteed <= 500KB JPEG data URL
+ * suitable for Firestore subcollection storage and PDF embedding.
+ */
+export function compressCanvasToDataUrl(
+  sourceCanvas: HTMLCanvasElement
+): string {
+  return compressDrawableToDataUrl(
+    sourceCanvas,
+    sourceCanvas.width,
+    sourceCanvas.height
   );
-  const ctx = tiny.getContext('2d');
-  if (ctx) {
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillRect(0, 0, tiny.width, tiny.height);
-    ctx.drawImage(sourceCanvas, 0, 0, tiny.width, tiny.height);
-    return tiny.toDataURL('image/jpeg', 0.45);
-  }
-  return sourceCanvas.toDataURL('image/jpeg', 0.45);
+}
+
+function decodeImageElement(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      if ((img.naturalWidth || img.width) > 0 && (img.naturalHeight || img.height) > 0) {
+        resolve(img);
+      } else {
+        reject(new Error('Image has zero dimensions.'));
+      }
+    };
+    img.onerror = () => reject(new Error('Failed to decode image.'));
+    img.src = src;
+  });
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('Failed to read image file.'));
+    reader.onload = () => {
+      if (typeof reader.result === 'string' && reader.result.length > 0) {
+        resolve(reader.result);
+      } else {
+        reject(new Error('Empty file read result.'));
+      }
+    };
+    reader.readAsDataURL(file);
+  });
 }
 
 /**
  * Compresses an uploaded image file to a crisp, Firestore-safe (<= 500KB) JPEG data URL.
- * Never returns an oversized or corrupted data URL.
+ * Uses direct-scaled drawing (never allocates a full 12MP-48MP canvas) with
+ * createImageBitmap -> ObjectURL -> FileReader fallback chain for mobile reliability.
  */
-export function compressImageFile(file: File): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const objectUrl = URL.createObjectURL(file);
-    const img = new Image();
-
-    const cleanup = () => URL.revokeObjectURL(objectUrl);
-
-    img.onerror = () => {
-      cleanup();
-      // Fallback via FileReader in case blob URL fails on some mobile browsers
-      const reader = new FileReader();
-      reader.onerror = () => reject(new Error('Failed to read image file.'));
-      reader.onload = () => {
-        const fallbackImg = new Image();
-        fallbackImg.onerror = () =>
-          reject(new Error('Unsupported image format. Please use JPG, PNG, or WebP.'));
-        fallbackImg.onload = () => {
-          const canvas = document.createElement('canvas');
-          canvas.width = fallbackImg.naturalWidth || fallbackImg.width || 640;
-          canvas.height = fallbackImg.naturalHeight || fallbackImg.height || 480;
-          const ctx = canvas.getContext('2d');
-          if (!ctx) {
-            reject(new Error('Canvas context unavailable.'));
-            return;
-          }
-          ctx.fillStyle = '#FFFFFF';
-          ctx.fillRect(0, 0, canvas.width, canvas.height);
-          ctx.drawImage(fallbackImg, 0, 0, canvas.width, canvas.height);
-          resolve(compressCanvasToDataUrl(canvas));
-        };
-        fallbackImg.src = reader.result as string;
-      };
-      reader.readAsDataURL(file);
-    };
-
-    img.onload = () => {
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth || img.width || 640;
-        canvas.height = img.naturalHeight || img.height || 480;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          cleanup();
-          reject(new Error('Canvas context unavailable.'));
-          return;
-        }
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        const compressed = compressCanvasToDataUrl(canvas);
-        cleanup();
-        resolve(compressed);
-      } catch (err) {
-        cleanup();
-        reject(err instanceof Error ? err : new Error('Failed to compress photo.'));
+export async function compressImageFile(file: File): Promise<string> {
+  // Strategy 1: createImageBitmap (handles EXIF orientation natively and avoids blob URL issues)
+  if (typeof createImageBitmap === 'function') {
+    let bitmap: ImageBitmap | null = null;
+    try {
+      bitmap = await createImageBitmap(file);
+      if (bitmap.width > 0 && bitmap.height > 0) {
+        return compressDrawableToDataUrl(bitmap, bitmap.width, bitmap.height);
       }
-    };
+    } catch {
+      // Fall through to HTMLImageElement decoding
+    } finally {
+      if (bitmap && typeof bitmap.close === 'function') {
+        bitmap.close();
+      }
+    }
+  }
 
-    img.src = objectUrl;
-  });
+  // Strategy 2: ObjectURL + HTMLImageElement (directly scaled onto small canvas)
+  let objectUrl: string | null = null;
+  try {
+    objectUrl = URL.createObjectURL(file);
+    const img = await decodeImageElement(objectUrl);
+    return compressDrawableToDataUrl(
+      img,
+      img.naturalWidth || img.width,
+      img.naturalHeight || img.height
+    );
+  } catch {
+    // Fall through to FileReader strategy
+  } finally {
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+    }
+  }
+
+  // Strategy 3: FileReader data URL + HTMLImageElement fallback
+  try {
+    const rawDataUrl = await readFileAsDataUrl(file);
+    const img = await decodeImageElement(rawDataUrl);
+    return compressDrawableToDataUrl(
+      img,
+      img.naturalWidth || img.width,
+      img.naturalHeight || img.height
+    );
+  } catch {
+    throw new Error(
+      'Unsupported or unreadable image format. Please use JPG, PNG, or WebP.'
+    );
+  }
 }
 
 /**
  * Ensures any existing data URL (such as a legacy photo from local storage)
  * is a valid JPEG within the Firestore-safe <= 500KB limit without ever truncating base64.
  */
-export function ensureSafePhotoDataUrl(dataUrl: string): Promise<string> {
-  if (!dataUrl || !dataUrl.startsWith('data:image/')) {
-    return Promise.reject(new Error('Invalid image data URL.'));
+export async function ensureSafePhotoDataUrl(dataUrl: string): Promise<string> {
+  if (!isValidImageDataUrl(dataUrl)) {
+    throw new Error('Invalid or corrupted image data.');
   }
   if (dataUrl.length <= MAX_SAFE_DATAURL_CHARS) {
-    return Promise.resolve(dataUrl);
+    return dataUrl;
   }
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onerror = () => reject(new Error('Could not re-compress oversized photo.'));
-    img.onload = () => {
-      try {
-        const canvas = document.createElement('canvas');
-        canvas.width = img.naturalWidth || img.width || 640;
-        canvas.height = img.naturalHeight || img.height || 480;
-        const ctx = canvas.getContext('2d');
-        if (!ctx) {
-          reject(new Error('Canvas context unavailable.'));
-          return;
-        }
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        resolve(compressCanvasToDataUrl(canvas));
-      } catch (err) {
-        reject(err instanceof Error ? err : new Error('Failed to re-compress photo.'));
-      }
-    };
-    img.src = dataUrl;
-  });
+  const img = await decodeImageElement(dataUrl);
+  return compressDrawableToDataUrl(
+    img,
+    img.naturalWidth || img.width,
+    img.naturalHeight || img.height
+  );
 }
 
 export function formatTakenTimestamp(iso: string): string {
@@ -361,7 +407,7 @@ export interface PdfLogoAsset {
  * PNG data URL for exact PDF embedding.
  */
 export function loadJiangNanLogoForPdf(
-  src = '/assets/aistudio/JN_LOGO_LANDSCAPE_25408581.png'
+  src = `${import.meta.env.BASE_URL}assets/aistudio/JN_LOGO_LANDSCAPE_25408581.png`
 ): Promise<PdfLogoAsset | null> {
   return new Promise((resolve) => {
     const img = new Image();

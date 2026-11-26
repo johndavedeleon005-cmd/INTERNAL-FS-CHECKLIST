@@ -1,7 +1,6 @@
 import { useState } from 'react';
 
-export const JIANG_NAN_LOGO_SRC =
-  '/assets/aistudio/JN_LOGO_LANDSCAPE_25408581.png';
+export const JIANG_NAN_LOGO_SRC = `${import.meta.env.BASE_URL}assets/aistudio/JN_LOGO_LANDSCAPE_25408581.png`;
 
 interface JiangNanLogoProps {
   className?: string;

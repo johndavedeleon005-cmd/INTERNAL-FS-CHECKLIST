@@ -41,6 +41,7 @@ import type {
 } from './types/inspection';
 import {
   type CloudReportSummary,
+  clearCloudReportCache,
   deleteReportOnline,
   deleteSinglePhotoOnline,
   loadAllUserPhotosOnline,
@@ -394,87 +395,127 @@ export default function App() {
     itemNumber: number,
     photo: PhotoProof
   ): Promise<boolean> => {
-    try {
-      const result = await uploadSinglePhotoImmediatelyOnline(
-        activeUser.uid,
-        snapshotReport,
-        itemNumber,
-        photo
-      );
+    const MAX_ATTEMPTS = 3;
+    const RETRY_DELAYS_MS = [700, 1800];
+    let lastErr: unknown = null;
 
-      setReport((prev) => {
-        if (
-          prev.id !== snapshotReport.id &&
-          prev.id !== result.reportId
-        ) {
-          return prev;
-        }
-        const current = prev.responses[itemNumber];
-        if (!current) return prev;
-        return {
-          ...prev,
-          id: result.reportId,
-          responses: {
-            ...prev.responses,
-            [itemNumber]: {
-              ...current,
-              photos: current.photos.map((p) =>
-                p.id === photo.id || p.id === result.photoId
-                  ? {
-                      ...p,
-                      id: result.photoId,
-                      dataUrl: result.safeDataUrl,
-                      uploadState: 'synced',
-                      uploadError: undefined,
-                    }
-                  : p
-              ),
-            },
-          },
-        };
-      });
-
-      setCloudPhotos((prev) => {
-        const filtered = prev.filter((p) => p.id !== result.storedRecord.id);
-        return [result.storedRecord, ...filtered];
-      });
-      setLastSyncedAt(new Date().toISOString());
-      return true;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isQuota = msg.includes('Quota exceeded');
-      if (isQuota) {
-        setStorageWarning(
-          'Daily Firestore free tier quota exceeded. Photo remains saved locally on this device.'
+    for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+      try {
+        const result = await uploadSinglePhotoImmediatelyOnline(
+          activeUser.uid,
+          reportRef.current.id === snapshotReport.id
+            ? reportRef.current
+            : snapshotReport,
+          itemNumber,
+          photo
         );
-      }
 
-      setReport((prev) => {
-        const current = prev.responses[itemNumber];
-        if (!current) return prev;
-        return {
-          ...prev,
-          responses: {
-            ...prev.responses,
-            [itemNumber]: {
-              ...current,
-              photos: current.photos.map((p) =>
-                p.id === photo.id
-                  ? {
-                      ...p,
-                      uploadState: 'error',
-                      uploadError: isQuota
-                        ? 'Cloud quota exceeded'
-                        : 'Upload failed',
-                    }
-                  : p
-              ),
+        setReport((prev) => {
+          if (
+            prev.id !== snapshotReport.id &&
+            prev.id !== result.reportId
+          ) {
+            return prev;
+          }
+          const current = prev.responses[itemNumber];
+          if (!current) return prev;
+          return {
+            ...prev,
+            id: result.reportId,
+            responses: {
+              ...prev.responses,
+              [itemNumber]: {
+                ...current,
+                photos: current.photos.map((p) =>
+                  p.id === photo.id || p.id === result.photoId
+                    ? {
+                        ...p,
+                        id: result.photoId,
+                        dataUrl: result.safeDataUrl,
+                        uploadState: 'synced',
+                        uploadError: undefined,
+                      }
+                    : p
+                ),
+              },
             },
-          },
-        };
-      });
-      return false;
+          };
+        });
+
+        setCloudPhotos((prev) => {
+          const filtered = prev.filter((p) => p.id !== result.storedRecord.id);
+          return [result.storedRecord, ...filtered];
+        });
+        setLastSyncedAt(new Date().toISOString());
+        return true;
+      } catch (err) {
+        lastErr = err;
+        const errMsg = err instanceof Error ? err.message : String(err);
+        const nonRetryable =
+          errMsg.includes('Quota exceeded') ||
+          errMsg.includes('Invalid or corrupted') ||
+          errMsg.includes('600 KB') ||
+          errMsg.includes('storage limits');
+
+        if (nonRetryable || attempt >= MAX_ATTEMPTS - 1) {
+          break;
+        }
+        const delayMs = RETRY_DELAYS_MS[attempt] ?? 1500;
+        await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+      }
     }
+
+    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    const isQuota = msg.includes('Quota exceeded');
+    const isPermission =
+      msg.includes('permission-denied') ||
+      msg.includes('Missing or insufficient permissions');
+    const isOffline =
+      msg.includes('offline') ||
+      msg.includes('unavailable') ||
+      msg.includes('network') ||
+      (typeof navigator !== 'undefined' && !navigator.onLine);
+    const isTooLarge = msg.includes('600 KB') || msg.includes('storage limits');
+
+    if (isQuota) {
+      setStorageWarning(
+        'Daily Firestore free tier quota exceeded. Photo remains saved locally on this device.'
+      );
+    }
+
+    const friendlyError = isQuota
+      ? 'Cloud quota exceeded'
+      : isTooLarge
+        ? 'Image too large to store'
+        : isOffline
+          ? 'Network offline — tap Retry'
+          : isPermission
+            ? 'Permission denied — sign in again'
+            : 'Upload failed — tap Retry';
+
+    setReport((prev) => {
+      const current = prev.responses[itemNumber];
+      if (!current) return prev;
+      return {
+        ...prev,
+        responses: {
+          ...prev.responses,
+          [itemNumber]: {
+            ...current,
+            photos: current.photos.map((p) =>
+              p.id === photo.id
+                ? {
+                    ...p,
+                    uploadState: 'error',
+                    uploadError: friendlyError,
+                  }
+                : p
+            ),
+          },
+        },
+      };
+    });
+    return false;
   };
 
   const attachPhotosToItem = (itemNumber: number, newPhotos: PhotoProof[]) => {
@@ -588,27 +629,77 @@ export default function App() {
     );
   };
 
+  const syncPendingOrFailedPhotos = (
+    activeUser: User,
+    includeLocal: boolean
+  ) => {
+    const targets: { itemNumber: number; photo: PhotoProof }[] = [];
+    for (const [numStr, resp] of Object.entries(reportRef.current.responses)) {
+      const itemNumber = Number(numStr);
+      for (const photo of resp.photos) {
+        if (
+          photo.uploadState === 'error' ||
+          (includeLocal && photo.uploadState === 'local')
+        ) {
+          targets.push({ itemNumber, photo });
+        }
+      }
+    }
+    if (targets.length === 0) return;
+
+    const targetIds = new Set(targets.map((t) => t.photo.id));
+    setReport((prev) => {
+      const nextResponses = { ...prev.responses };
+      for (const { itemNumber } of targets) {
+        const resp = nextResponses[itemNumber];
+        if (!resp) continue;
+        nextResponses[itemNumber] = {
+          ...resp,
+          photos: resp.photos.map((p) =>
+            targetIds.has(p.id)
+              ? { ...p, uploadState: 'uploading', uploadError: undefined }
+              : p
+          ),
+        };
+      }
+      return { ...prev, responses: nextResponses };
+    });
+
+    showToast(
+      `Syncing ${targets.length} pending ${targets.length === 1 ? 'photo' : 'photos'} online…`
+    );
+
+    void (async () => {
+      let okCount = 0;
+      let failCount = 0;
+      for (const { itemNumber, photo } of targets) {
+        const ok = await uploadSinglePhotoTask(
+          activeUser,
+          reportRef.current,
+          itemNumber,
+          photo
+        );
+        if (ok) okCount++;
+        else failCount++;
+      }
+      if (failCount === 0 && okCount > 0) {
+        showToast(
+          `${okCount} ${okCount === 1 ? 'photo' : 'photos'} synced online`
+        );
+      } else if (failCount > 0) {
+        showToast(
+          `${failCount} ${failCount === 1 ? 'photo' : 'photos'} still failed — tap Retry`
+        );
+      }
+    })();
+  };
+
   const retryAllFailedPhotos = () => {
     if (!user) {
       showToast('Sign in with Google to upload photos online');
       return;
     }
-    const failedTargets: { itemNumber: number; photoId: string }[] = [];
-    for (const [numStr, resp] of Object.entries(reportRef.current.responses)) {
-      const itemNumber = Number(numStr);
-      for (const photo of resp.photos) {
-        if (photo.uploadState === 'error') {
-          failedTargets.push({ itemNumber, photoId: photo.id });
-        }
-      }
-    }
-    if (failedTargets.length === 0) return;
-    showToast(
-      `Retrying ${failedTargets.length} failed ${failedTargets.length === 1 ? 'photo' : 'photos'}…`
-    );
-    for (const target of failedTargets) {
-      retryPhotoUpload(target.itemNumber, target.photoId);
-    }
+    syncPendingOrFailedPhotos(user, true);
   };
 
   const updatePhotoCaption = (
@@ -733,12 +824,19 @@ export default function App() {
   const handleSignIn = async () => {
     setIsSigningIn(true);
     try {
-      await signInWithGoogle();
+      const cred = await signInWithGoogle();
       setStorageWarning(null);
       showToast('Signed in with Google — online cloud storage enabled');
+      if (cred.user) {
+        syncPendingOrFailedPhotos(cred.user, true);
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      if (!msg.includes('popup-closed-by-user')) {
+      if (msg.includes('unauthorized-domain')) {
+        setStorageWarning(
+          `Sign-in blocked on "${window.location.hostname}". Add this domain to Firebase Console → Authentication → Settings → Authorized domains.`
+        );
+      } else if (!msg.includes('popup-closed-by-user')) {
         showToast('Sign-in failed. Please allow popups and try again.');
       }
     } finally {
@@ -747,6 +845,7 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
+    clearCloudReportCache();
     await signOutUser();
     showToast('Signed out');
   };
@@ -1514,11 +1613,16 @@ export default function App() {
             onRetryFailedPhotos={retryAllFailedPhotos}
             onSignIn={handleSignIn}
             onConnectivityChange={(online) => {
-              showToast(
-                online
-                  ? 'Connection restored — ready to sync online'
-                  : 'You are offline — edits and photos remain saved locally'
-              );
+              if (online) {
+                showToast('Connection restored — ready to sync online');
+                if (user) {
+                  syncPendingOrFailedPhotos(user, true);
+                }
+              } else {
+                showToast(
+                  'You are offline — edits and photos remain saved locally'
+                );
+              }
             }}
           />
           <button
