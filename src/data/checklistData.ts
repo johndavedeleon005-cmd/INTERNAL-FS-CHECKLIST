@@ -6,6 +6,8 @@ import type {
 
 export const FORM_DOCUMENTATION_NO = 'IQAF-005';
 export const FORM_REVISION_NO = '0';
+export const IQAF_BASIS_STATEMENT =
+  'Basis: This store inspection checklist and report was prepared using IQAF-005 (Store Inspection Checklist, Rev. 0) as basis.';
 
 export const HOW_TO_FILL_INSTRUCTION =
   'How to fill in: choose Yes, No, or N/A under "Complied?" for every item. For each No, write the deviation and the corrective action. Example: No | Nail polish seen on 2 servers | Servers told to remove it; recheck on next visit.';
@@ -609,4 +611,17 @@ export function formatDisplayTime(timeStr: string): string {
   const suffix = h >= 12 ? 'PM' : 'AM';
   const hour12 = h % 12 || 12;
   return `${hour12}:${String(m).padStart(2, '0')} ${suffix}`;
+}
+
+export function formatReportNo(
+  storeLocation: string,
+  dateOfInspection: string
+): string {
+  const branch =
+    (storeLocation || '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toUpperCase() || 'BRANCH NAME';
+  const datePart = (dateOfInspection || '').trim() || getTodayDateString();
+  return `INSPLND-${branch}-${datePart}`;
 }

@@ -1,0 +1,274 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Pillar 0: Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // =========================================================================
+    // GLOBAL HARDENED PRIMITIVES
+    // =========================================================================
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidSignOffEntry(entry) {
+      return entry is map
+        && entry.keys().hasAll(['printedName', 'date', 'signatureDataUrl'])
+        && entry.keys().hasOnly(['printedName', 'date', 'signatureDataUrl'])
+        && entry.printedName is string && entry.printedName.size() <= 160
+        && entry.date is string && entry.date.size() <= 20
+        && (
+          entry.signatureDataUrl == null ||
+          (entry.signatureDataUrl is string && entry.signatureDataUrl.size() <= 150000)
+        );
+    }
+
+    function isValidSignOffs(signOffs) {
+      return signOffs is map
+        && signOffs.keys().hasAll(['performedBy', 'acknowledgedBy', 'notedBy'])
+        && signOffs.keys().hasOnly(['performedBy', 'acknowledgedBy', 'notedBy'])
+        && isValidSignOffEntry(signOffs.performedBy)
+        && isValidSignOffEntry(signOffs.acknowledgedBy)
+        && isValidSignOffEntry(signOffs.notedBy);
+    }
+
+    function isValidStats(stats) {
+      return stats is map
+        && stats.keys().hasAll(['answered', 'yes', 'no', 'na', 'photoCount'])
+        && stats.keys().hasOnly(['answered', 'yes', 'no', 'na', 'photoCount'])
+        && stats.answered is int && stats.answered >= 0 && stats.answered <= 67
+        && stats.yes is int && stats.yes >= 0 && stats.yes <= 67
+        && stats.no is int && stats.no >= 0 && stats.no <= 67
+        && stats.na is int && stats.na >= 0 && stats.na <= 67
+        && stats.photoCount is int && stats.photoCount >= 0 && stats.photoCount <= 500;
+    }
+
+    function isValidReport(data) {
+      return data is map
+        && data.keys().hasAll([
+          'ownerId',
+          'documentationNo',
+          'revisionNo',
+          'dateOfInspection',
+          'storeLocation',
+          'timeOfInspection',
+          'inspectedBy',
+          'responses',
+          'signOffs',
+          'stats',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'documentationNo',
+          'revisionNo',
+          'dateOfInspection',
+          'storeLocation',
+          'timeOfInspection',
+          'inspectedBy',
+          'responses',
+          'signOffs',
+          'stats',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && data.documentationNo is string && data.documentationNo.size() <= 40
+        && data.revisionNo is string && data.revisionNo.size() <= 20
+        && data.dateOfInspection is string && data.dateOfInspection.size() <= 20
+        && data.storeLocation is string && data.storeLocation.size() <= 200
+        && data.timeOfInspection is string && data.timeOfInspection.size() <= 20
+        && data.inspectedBy is string && data.inspectedBy.size() <= 160
+        && data.responses is map && data.responses.size() <= 67
+        && isValidSignOffs(data.signOffs)
+        && isValidStats(data.stats)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidPhoto(data, reportId) {
+      return data is map
+        && data.keys().hasAll([
+          'ownerId',
+          'reportId',
+          'itemNumber',
+          'sectionCode',
+          'sectionTitle',
+          'itemText',
+          'complied',
+          'deviation',
+          'caption',
+          'fileName',
+          'storeLocation',
+          'inspectionDate',
+          'dataUrl',
+          'capturedAt',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'ownerId',
+          'reportId',
+          'itemNumber',
+          'sectionCode',
+          'sectionTitle',
+          'itemText',
+          'complied',
+          'deviation',
+          'caption',
+          'fileName',
+          'storeLocation',
+          'inspectionDate',
+          'dataUrl',
+          'capturedAt',
+          'createdAt',
+          'updatedAt'
+        ])
+        && isValidId(data.ownerId)
+        && data.ownerId == request.auth.uid
+        && isValidId(data.reportId)
+        && data.reportId == reportId
+        && data.itemNumber is int && data.itemNumber >= 1 && data.itemNumber <= 67
+        && data.sectionCode is string && data.sectionCode.size() >= 1 && data.sectionCode.size() <= 4
+        && data.sectionTitle is string && data.sectionTitle.size() <= 120
+        && data.itemText is string && data.itemText.size() <= 400
+        && data.complied is string && data.complied.size() <= 10 && data.complied in ['', 'Yes', 'No', 'N/A']
+        && data.deviation is string && data.deviation.size() <= 2000
+        && data.caption is string && data.caption.size() <= 500
+        && data.fileName is string && data.fileName.size() <= 200
+        && data.storeLocation is string && data.storeLocation.size() <= 200
+        && data.inspectionDate is string && data.inspectionDate.size() <= 20
+        && data.dataUrl is string && data.dataUrl.size() >= 1 && data.dataUrl.size() <= 600000
+        && data.capturedAt is string && data.capturedAt.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Master Gate helper for subcollections (called only AFTER auth & static validation)
+    function isReportOwner(reportId) {
+      return exists(/databases/$(database)/documents/reports/$(reportId))
+        && get(/databases/$(database)/documents/reports/$(reportId)).data.ownerId == request.auth.uid;
+    }
+
+    // =========================================================================
+    // COLLECTION: /reports/{reportId}
+    // =========================================================================
+    match /reports/{reportId} {
+      allow get: if isVerifiedUser()
+        && isValidId(reportId)
+        && (resource == null || existing().ownerId == request.auth.uid);
+
+      allow list: if isVerifiedUser()
+        && resource.data.ownerId == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(reportId)
+        && isValidReport(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+
+      allow update: if isVerifiedUser()
+        && isValidId(reportId)
+        && isValidReport(incoming())
+        && existing().ownerId == request.auth.uid
+        && incoming().ownerId == existing().ownerId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          // Action 1: Edit and save report content (editable anytime by owner)
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'documentationNo',
+            'revisionNo',
+            'dateOfInspection',
+            'storeLocation',
+            'timeOfInspection',
+            'inspectedBy',
+            'responses',
+            'signOffs',
+            'stats',
+            'updatedAt'
+          ]) ||
+          // Action 2: Sync denormalized photoCount stats
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'stats',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(reportId)
+        && existing().ownerId == request.auth.uid;
+
+      // =======================================================================
+      // SUBCOLLECTION: /reports/{reportId}/photos/{photoId}
+      // =======================================================================
+      match /photos/{photoId} {
+        allow get: if isVerifiedUser()
+          && isValidId(reportId)
+          && isValidId(photoId)
+          && existing().ownerId == request.auth.uid
+          && isReportOwner(reportId);
+
+        allow list: if isVerifiedUser()
+          && resource.data.ownerId == request.auth.uid;
+
+        allow create: if isVerifiedUser()
+          && isValidId(reportId)
+          && isValidId(photoId)
+          && isValidPhoto(incoming(), reportId)
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isReportOwner(reportId);
+
+        allow update: if isVerifiedUser()
+          && isValidId(reportId)
+          && isValidId(photoId)
+          && isValidPhoto(incoming(), reportId)
+          && existing().ownerId == request.auth.uid
+          && incoming().ownerId == existing().ownerId
+          && incoming().reportId == existing().reportId
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && isReportOwner(reportId)
+          && (
+            // Action 1: Update photo caption or synced report item metadata
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'caption',
+              'complied',
+              'deviation',
+              'storeLocation',
+              'inspectionDate',
+              'updatedAt'
+            ])
+          );
+
+        allow delete: if isVerifiedUser()
+          && isValidId(reportId)
+          && isValidId(photoId)
+          && existing().ownerId == request.auth.uid
+          && isReportOwner(reportId);
+      }
+    }
+  }
+}

@@ -4,15 +4,21 @@ import {
   ALL_CHECKLIST_ITEMS,
   CHECKLIST_SECTIONS,
   HOW_TO_FILL_INSTRUCTION,
+  IQAF_BASIS_STATEMENT,
   formatDisplayDate,
   formatDisplayTime,
+  formatReportNo,
 } from '../data/checklistData';
 import type {
   InspectionReport,
   PdfExportOptions,
   PhotoProof,
 } from '../types/inspection';
-import { getImageDimensions, renderJiangNanLogoDataUrl } from './imageUtils';
+import {
+  formatTakenTimestamp,
+  getImageDimensions,
+  loadJiangNanLogoForPdf,
+} from './imageUtils';
 
 export interface IndexedPhotoProof {
   photoIndex: number;
@@ -66,6 +72,7 @@ function sanitizeFilePart(value: string, fallback: string): string {
 export async function exportInspectionToPdf(
   report: InspectionReport,
   options: PdfExportOptions = {
+    includeSummary: true,
     includePhotoAppendix: true,
     includeInlineThumbnails: false,
   }
@@ -81,8 +88,25 @@ export async function exportInspectionToPdf(
   const pageHeight = doc.internal.pageSize.getHeight(); // 279.4mm
   const marginX = 12.7;
   const contentWidth = pageWidth - marginX * 2; // 190.5mm
+  const reportNo = formatReportNo(
+    report.meta.storeLocation,
+    report.meta.dateOfInspection
+  );
 
-  const logoDataUrl = renderJiangNanLogoDataUrl();
+  const logoAsset = await loadJiangNanLogoForPdf();
+  const drawLogoInBox = (
+    boxX: number,
+    boxY: number,
+    maxW: number,
+    maxH: number
+  ) => {
+    if (!logoAsset) return;
+    const scale = Math.min(maxW / logoAsset.width, maxH / logoAsset.height);
+    const drawW = logoAsset.width * scale;
+    const drawH = logoAsset.height * scale;
+    const drawY = boxY + (maxH - drawH) / 2;
+    doc.addImage(logoAsset.dataUrl, 'PNG', boxX, drawY, drawW, drawH);
+  };
   const indexedPhotos = collectIndexedPhotos(report);
   const photoNumbersByItem = new Map<number, number[]>();
   for (const entry of indexedPhotos) {
@@ -125,10 +149,7 @@ export async function exportInspectionToPdf(
   doc.setFillColor(255, 255, 255);
   doc.rect(marginX, cursorY, leftTitleW, headerTopH, 'FD');
 
-  if (logoDataUrl) {
-    // Logo positioned cleanly at left of header cell
-    doc.addImage(logoDataUrl, 'PNG', marginX + 2.5, cursorY + 3.2, 26, 6.7);
-  }
+  drawLogoInBox(marginX + 2.5, cursorY + 2, 28, headerTopH - 4);
 
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(11);
@@ -208,7 +229,7 @@ export async function exportInspectionToPdf(
     cursorY += metaRowH;
   }
 
-  // Exact italic "How to fill in" instruction line
+  // Exact italic "How to fill in" instruction line & IQAF-005 basis note
   cursorY += 3.5;
   doc.setFont('helvetica', 'italic');
   doc.setFontSize(7.2);
@@ -218,7 +239,14 @@ export async function exportInspectionToPdf(
     contentWidth
   );
   doc.text(instructionLines, marginX, cursorY);
-  cursorY += instructionLines.length * 3.1 + 1.8;
+  cursorY += instructionLines.length * 3.1 + 1.1;
+
+  doc.setFont('helvetica', 'bold');
+  doc.setFontSize(7);
+  doc.setTextColor(51, 65, 85);
+  const basisLines = doc.splitTextToSize(IQAF_BASIS_STATEMENT, contentWidth);
+  doc.text(basisLines, marginX, cursorY);
+  cursorY += basisLines.length * 3.0 + 1.6;
 
   // =========================================================================
   // MAIN 67-ITEM CHECKLIST TABLE
@@ -444,13 +472,13 @@ export async function exportInspectionToPdf(
     },
     {
       heading: 'Acknowledged By',
-      role: 'Restaurant / Shift Manager / Area Manager',
+      role: 'Restaurant / Shift Manager',
       entry: report.signOffs.acknowledgedBy,
       key: 'acknowledgedBy',
     },
     {
       heading: 'Noted By',
-      role: 'Immediate Manager',
+      role: 'Area Manager',
       entry: report.signOffs.notedBy,
       key: 'notedBy',
     },
@@ -525,7 +553,7 @@ export async function exportInspectionToPdf(
     );
   });
 
-  // Department & Form # line directly beneath sign-off table
+  // Department & Basis Form # line directly beneath sign-off table
   const deptY = sigY + sigHeaderH + sigBoxH + sigLabelH + 5.5;
   doc.setFont('helvetica', 'bold');
   doc.setFontSize(7.5);
@@ -534,11 +562,330 @@ export async function exportInspectionToPdf(
 
   doc.setFont('helvetica', 'normal');
   doc.text(
-    `Form #: ${report.meta.documentationNo || 'IQAF-005'}   Revision No.: ${report.meta.revisionNo || '0'}`,
+    `Basis Form #: ${report.meta.documentationNo || 'IQAF-005'}   Revision No.: ${report.meta.revisionNo || '0'}`,
     marginX + contentWidth / 2,
     deptY,
     { align: 'center' }
   );
+
+  // =========================================================================
+  // INSPECTION SUMMARY SHEET (Exact IQAF-005 Table Styling)
+  // =========================================================================
+  if (options.includeSummary) {
+    doc.addPage();
+    let sy = 10.5;
+
+    // Matching IQAF-005 header strip
+    doc.setDrawColor(64, 64, 64);
+    doc.setLineWidth(0.22);
+    doc.setFillColor(255, 255, 255);
+    doc.rect(marginX, sy, leftTitleW, 13, 'FD');
+
+    drawLogoInBox(marginX + 2.5, sy + 1.8, 25, 9.4);
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(10.5);
+    doc.setTextColor(17, 17, 17);
+    doc.text('Store Inspection Summary', marginX + 67, sy + 6.2, {
+      align: 'center',
+    });
+    doc.setFont('helvetica', 'normal');
+    doc.setFontSize(7.3);
+    doc.setTextColor(64, 64, 64);
+    const sumSub = [
+      report.meta.storeLocation || 'Store Inspection',
+      formatDisplayDate(report.meta.dateOfInspection),
+      report.meta.inspectedBy ? `Inspector: ${report.meta.inspectedBy}` : '',
+    ]
+      .filter(Boolean)
+      .join('  |  ');
+    doc.text(sumSub, marginX + 67, sy + 10.5, {
+      align: 'center',
+      maxWidth: 74,
+    });
+
+    const sxRight = marginX + leftTitleW;
+    doc.setFillColor(255, 255, 255);
+    doc.rect(sxRight, sy, rightDocLabelW, 6.5, 'FD');
+    doc.rect(sxRight + rightDocLabelW, sy, rightDocValW, 6.5, 'FD');
+    doc.rect(sxRight, sy + 6.5, rightDocLabelW, 6.5, 'FD');
+    doc.rect(sxRight + rightDocLabelW, sy + 6.5, rightDocValW, 6.5, 'FD');
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.8);
+    doc.setTextColor(17, 17, 17);
+    doc.text('Documentation No.:', sxRight + rightDocLabelW - 2, sy + 4.4, {
+      align: 'right',
+    });
+    doc.text('Revision No.:', sxRight + rightDocLabelW - 2, sy + 10.8, {
+      align: 'right',
+    });
+
+    doc.setFont('helvetica', 'normal');
+    doc.text(
+      report.meta.documentationNo || 'IQAF-005',
+      sxRight + rightDocLabelW + 2,
+      sy + 4.4
+    );
+    doc.text(
+      report.meta.revisionNo || '0',
+      sxRight + rightDocLabelW + 2,
+      sy + 10.8
+    );
+
+    sy += 17;
+
+    // Compute overall & section metrics
+    let totalYes = 0;
+    let totalNo = 0;
+    let totalNa = 0;
+    let totalPending = 0;
+
+    const categoryRows: string[][] = [];
+    const deviationRows: string[][] = [];
+
+    for (const section of CHECKLIST_SECTIONS) {
+      let sYes = 0;
+      let sNo = 0;
+      let sNa = 0;
+      let sPending = 0;
+      let sPhotos = 0;
+
+      for (const item of section.items) {
+        const r = report.responses[item.number];
+        const status = r?.complied || '';
+        const pCount = r?.photos?.length ?? 0;
+        sPhotos += pCount;
+
+        if (status === 'Yes') {
+          sYes++;
+          totalYes++;
+        } else if (status === 'No') {
+          sNo++;
+          totalNo++;
+          const pNums = photoNumbersByItem.get(item.number) ?? [];
+          const pRef =
+            pNums.length > 0 ? pNums.map((n) => `#${n}`).join(', ') : '—';
+          deviationRows.push([
+            String(item.number),
+            `${section.code}. ${section.title}\n${item.text}`,
+            r?.deviation?.trim() || '—',
+            r?.correctiveAction?.trim() || '—',
+            pRef,
+          ]);
+        } else if (status === 'N/A') {
+          sNa++;
+          totalNa++;
+        } else {
+          sPending++;
+          totalPending++;
+        }
+      }
+
+      const sApplicable = sYes + sNo;
+      const sScore =
+        sApplicable > 0 ? `${Math.round((sYes / sApplicable) * 100)}%` : '—';
+
+      categoryRows.push([
+        `${section.code}. ${section.title}`,
+        String(section.items.length),
+        String(sYes),
+        String(sNo),
+        String(sNa),
+        String(sPending),
+        String(sPhotos),
+        sScore,
+      ]);
+    }
+
+    const totalApplicable = totalYes + totalNo;
+    const totalAnswered = totalYes + totalNo + totalNa;
+    const overallScore =
+      totalApplicable > 0
+        ? `${Math.round((totalYes / totalApplicable) * 100)}%`
+        : '—';
+
+    // Overall KPI Summary Grid
+    autoTable(doc, {
+      startY: sy,
+      margin: { top: 11, right: marginX, bottom: 14, left: marginX },
+      tableWidth: contentWidth,
+      theme: 'grid',
+      head: [
+        [
+          {
+            content: 'Overall Compliance Summary',
+            colSpan: 6,
+            styles: { halign: 'left' },
+          },
+        ],
+      ],
+      body: [
+        [
+          { content: 'Compliance Rate', styles: { fillColor: [239, 239, 239], fontStyle: 'bold' } },
+          { content: overallScore, styles: { fontStyle: 'bold', halign: 'center' } },
+          { content: 'Items Checked', styles: { fillColor: [239, 239, 239], fontStyle: 'bold' } },
+          { content: `${totalAnswered} / ${ALL_CHECKLIST_ITEMS.length}`, styles: { halign: 'center' } },
+          { content: 'Photo Proofs', styles: { fillColor: [239, 239, 239], fontStyle: 'bold' } },
+          { content: String(indexedPhotos.length), styles: { halign: 'center' } },
+        ],
+        [
+          { content: 'Complied (Yes)', styles: { fillColor: [239, 239, 239], fontStyle: 'bold' } },
+          { content: String(totalYes), styles: { textColor: [22, 101, 52], fontStyle: 'bold', halign: 'center' } },
+          { content: 'Deviations (No)', styles: { fillColor: [239, 239, 239], fontStyle: 'bold' } },
+          { content: String(totalNo), styles: { textColor: totalNo > 0 ? [185, 28, 28] : [17, 17, 17], fontStyle: 'bold', halign: 'center' } },
+          { content: 'N/A / Pending', styles: { fillColor: [239, 239, 239], fontStyle: 'bold' } },
+          { content: `${totalNa} N/A · ${totalPending} Pending`, styles: { halign: 'center' } },
+        ],
+      ],
+      headStyles: {
+        fillColor: [64, 64, 64],
+        textColor: [255, 255, 255],
+        fontStyle: 'bold',
+        fontSize: 8,
+        lineColor: [64, 64, 64],
+        lineWidth: 0.22,
+      },
+      styles: {
+        font: 'helvetica',
+        fontSize: 8,
+        textColor: [17, 17, 17],
+        lineColor: [64, 64, 64],
+        lineWidth: 0.2,
+        cellPadding: { top: 2, right: 2, bottom: 2, left: 2 },
+      },
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const afterKpiY = ((doc as any).lastAutoTable?.finalY ?? sy) + 5;
+
+    // Category Breakdown Table (Sections A–Q)
+    autoTable(doc, {
+      startY: afterKpiY,
+      margin: { top: 11, right: marginX, bottom: 14, left: marginX },
+      tableWidth: contentWidth,
+      theme: 'grid',
+      head: [
+        [
+          'Category (Sections A–Q)',
+          'Items',
+          'Yes',
+          'No',
+          'N/A',
+          'Pending',
+          'Photos',
+          'Score',
+        ],
+      ],
+      body: [
+        ...categoryRows,
+        [
+          { content: 'Total (All 17 Categories)', styles: { fontStyle: 'bold', fillColor: [217, 217, 217] } },
+          { content: String(ALL_CHECKLIST_ITEMS.length), styles: { fontStyle: 'bold', fillColor: [217, 217, 217] } },
+          { content: String(totalYes), styles: { fontStyle: 'bold', fillColor: [217, 217, 217], textColor: [22, 101, 52] } },
+          { content: String(totalNo), styles: { fontStyle: 'bold', fillColor: [217, 217, 217], textColor: totalNo > 0 ? [185, 28, 28] : [17, 17, 17] } },
+          { content: String(totalNa), styles: { fontStyle: 'bold', fillColor: [217, 217, 217] } },
+          { content: String(totalPending), styles: { fontStyle: 'bold', fillColor: [217, 217, 217] } },
+          { content: String(indexedPhotos.length), styles: { fontStyle: 'bold', fillColor: [217, 217, 217] } },
+          { content: overallScore, styles: { fontStyle: 'bold', fillColor: [217, 217, 217] } },
+        ],
+      ],
+      headStyles: {
+        fillColor: [64, 64, 64],
+        textColor: [255, 255, 255],
+        fontStyle: 'bold',
+        fontSize: 7.8,
+        halign: 'center',
+        lineColor: [64, 64, 64],
+        lineWidth: 0.22,
+      },
+      styles: {
+        font: 'helvetica',
+        fontSize: 7.6,
+        textColor: [17, 17, 17],
+        lineColor: [64, 64, 64],
+        lineWidth: 0.2,
+        cellPadding: { top: 1.5, right: 2, bottom: 1.5, left: 2 },
+      },
+      columnStyles: {
+        0: { cellWidth: 85.5, halign: 'left' },
+        1: { cellWidth: 14, halign: 'center' },
+        2: { cellWidth: 14, halign: 'center' },
+        3: { cellWidth: 14, halign: 'center' },
+        4: { cellWidth: 14, halign: 'center' },
+        5: { cellWidth: 16, halign: 'center' },
+        6: { cellWidth: 16, halign: 'center' },
+        7: { cellWidth: 17, halign: 'center', fontStyle: 'bold' },
+      },
+      rowPageBreak: 'avoid',
+    });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const afterCatY = ((doc as any).lastAutoTable?.finalY ?? afterKpiY) + 5;
+
+    // Consolidated Deviations & Corrective Actions Table
+    autoTable(doc, {
+      startY: afterCatY,
+      margin: { top: 11, right: marginX, bottom: 14, left: marginX },
+      tableWidth: contentWidth,
+      theme: 'grid',
+      head: [
+        [
+          {
+            content: `Summary of Deviations & Corrective Actions (${deviationRows.length})`,
+            colSpan: 5,
+            styles: { halign: 'left' },
+          },
+        ],
+        [
+          'No.',
+          'Category & Inspection Item',
+          'Deviation / Findings',
+          'Corrective Action',
+          'Photos',
+        ],
+      ],
+      body:
+        deviationRows.length > 0
+          ? deviationRows
+          : [
+              [
+                {
+                  content: 'No non-compliant items ("No") were recorded during this inspection.',
+                  colSpan: 5,
+                  styles: { halign: 'center', fontStyle: 'italic', textColor: [71, 85, 105] },
+                },
+              ],
+            ],
+      headStyles: {
+        fillColor: [64, 64, 64],
+        textColor: [255, 255, 255],
+        fontStyle: 'bold',
+        fontSize: 7.8,
+        halign: 'center',
+        lineColor: [64, 64, 64],
+        lineWidth: 0.22,
+      },
+      styles: {
+        font: 'helvetica',
+        fontSize: 7.5,
+        textColor: [17, 17, 17],
+        lineColor: [64, 64, 64],
+        lineWidth: 0.2,
+        cellPadding: { top: 1.7, right: 2, bottom: 1.7, left: 2 },
+        overflow: 'linebreak',
+      },
+      columnStyles: {
+        0: { cellWidth: 10, halign: 'center', fontStyle: 'bold', textColor: [185, 28, 28] },
+        1: { cellWidth: 62.5, halign: 'left' },
+        2: { cellWidth: 50, halign: 'left' },
+        3: { cellWidth: 50, halign: 'left' },
+        4: { cellWidth: 18, halign: 'center' },
+      },
+      showHead: 'everyPage',
+      rowPageBreak: 'avoid',
+    });
+  }
 
   // =========================================================================
   // PHOTO PROOF & EVIDENCE APPENDIX (when photos attached)
@@ -563,9 +910,7 @@ export async function exportInspectionToPdf(
       doc.setFillColor(255, 255, 255);
       doc.rect(marginX, ay, leftTitleW, 13, 'FD');
 
-      if (logoDataUrl) {
-        doc.addImage(logoDataUrl, 'PNG', marginX + 2.5, ay + 2.8, 23, 6);
-      }
+      drawLogoInBox(marginX + 2.5, ay + 1.8, 25, 9.4);
 
       doc.setFont('helvetica', 'bold');
       doc.setFontSize(10);
@@ -733,12 +1078,12 @@ export async function exportInspectionToPdf(
           doc.text(devLines, cx + 2.4, textY);
         }
 
-        // Captured timestamp pinned at bottom-left of card
+        // Photo-taken timestamp pinned at bottom-left of card
         doc.setFont('helvetica', 'normal');
         doc.setFontSize(6.5);
         doc.setTextColor(100, 116, 139);
         const capturedLabel = entry.photo.capturedAt
-          ? `Captured: ${new Date(entry.photo.capturedAt).toLocaleString()}`
+          ? `Taken: ${formatTakenTimestamp(entry.photo.capturedAt)}`
           : '';
         doc.text(capturedLabel, cx + 2.4, cy + cardH - 2.2);
       });
@@ -746,27 +1091,39 @@ export async function exportInspectionToPdf(
   }
 
   // =========================================================================
-  // EXACT FOOTER ON EVERY PAGE ("IQAF-005 Store Inspection Checklist | Page X of Y")
+  // EVERY-PAGE FOOTER: Automatic Report No. + IQAF-005 Basis + Page X of Y
   // =========================================================================
   const totalPages = doc.getNumberOfPages();
+  const docNo = report.meta.documentationNo || 'IQAF-005';
   for (let p = 1; p <= totalPages; p++) {
     doc.setPage(p);
+    doc.setDrawColor(190, 195, 204);
+    doc.setLineWidth(0.18);
+    doc.line(marginX, pageHeight - 11.4, pageWidth - marginX, pageHeight - 11.4);
+
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.1);
+    doc.setTextColor(17, 17, 17);
+    doc.text(`Report No.: ${reportNo}`, marginX, pageHeight - 7.5, {
+      maxWidth: contentWidth - 76,
+    });
+
     doc.setFont('helvetica', 'normal');
-    doc.setFontSize(7.2);
-    doc.setTextColor(34, 34, 34);
+    doc.setFontSize(7.1);
+    doc.setTextColor(51, 65, 85);
     doc.text(
-      `${report.meta.documentationNo || 'IQAF-005'} Store Inspection Checklist | Page ${p} of ${totalPages}`,
-      pageWidth / 2,
-      pageHeight - 8,
-      { align: 'center' }
+      `Basis: ${docNo} Store Inspection Checklist | Page ${p} of ${totalPages}`,
+      pageWidth - marginX,
+      pageHeight - 7.5,
+      { align: 'right' }
     );
   }
 
   // Verify ALL_CHECKLIST_ITEMS count consistency silently
   void ALL_CHECKLIST_ITEMS;
 
-  const storePart = sanitizeFilePart(report.meta.storeLocation, 'Store');
-  const datePart = sanitizeFilePart(report.meta.dateOfInspection, 'Report');
-  const fileName = `IQAF-005_Store_Inspection_${storePart}_${datePart}.pdf`;
+  const storePart = sanitizeFilePart(report.meta.storeLocation, 'BRANCH');
+  const datePart = sanitizeFilePart(report.meta.dateOfInspection, 'DATE');
+  const fileName = `INSPLND-${storePart}-${datePart}.pdf`;
   doc.save(fileName);
 }

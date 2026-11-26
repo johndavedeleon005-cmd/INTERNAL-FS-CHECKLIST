@@ -1,0 +1,204 @@
+{
+  "entities": {
+    "InspectionReport": {
+      "title": "InspectionReport",
+      "description": "An IQAF-005 Store Inspection Checklist report owned by an authenticated inspector, editable anytime.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the authenticated inspector who owns this report."
+        },
+        "documentationNo": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Form documentation number (default IQAF-005)."
+        },
+        "revisionNo": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Form revision number (default 0)."
+        },
+        "dateOfInspection": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Inspection date in YYYY-MM-DD format."
+        },
+        "storeLocation": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Store branch or facility name."
+        },
+        "timeOfInspection": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Inspection time in HH:MM format."
+        },
+        "inspectedBy": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Full name of the inspector."
+        },
+        "responses": {
+          "type": "object",
+          "description": "Map of checklist item number strings ('1'-'67') to compliance status, deviation, and corrective action."
+        },
+        "signOffs": {
+          "type": "object",
+          "description": "Map of performedBy, acknowledgedBy, and notedBy sign-off entries including printedName, date, and signatureDataUrl."
+        },
+        "stats": {
+          "type": "object",
+          "description": "Denormalized summary counts (answered, yes, no, na, photoCount) for fast report listing."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the report was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the report was last saved."
+        }
+      },
+      "required": [
+        "ownerId",
+        "documentationNo",
+        "revisionNo",
+        "dateOfInspection",
+        "storeLocation",
+        "timeOfInspection",
+        "inspectedBy",
+        "responses",
+        "signOffs",
+        "stats",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "InspectionPhoto": {
+      "title": "InspectionPhoto",
+      "description": "A compressed photo proof document stored in a report's photos subcollection so reports can hold many photos online without exceeding document size limits.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the report owner."
+        },
+        "reportId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Parent InspectionReport document ID."
+        },
+        "itemNumber": {
+          "type": "integer",
+          "description": "Checklist item number from 1 to 67."
+        },
+        "sectionCode": {
+          "type": "string",
+          "maxLength": 4,
+          "description": "Checklist section letter (A through Q)."
+        },
+        "sectionTitle": {
+          "type": "string",
+          "maxLength": 120,
+          "description": "Section title."
+        },
+        "itemText": {
+          "type": "string",
+          "maxLength": 400,
+          "description": "Checklist inspection criterion text."
+        },
+        "complied": {
+          "type": "string",
+          "enum": ["", "Yes", "No", "N/A"],
+          "maxLength": 10,
+          "description": "Compliance status of the item."
+        },
+        "deviation": {
+          "type": "string",
+          "maxLength": 2000,
+          "description": "Deviation or findings recorded for the item."
+        },
+        "caption": {
+          "type": "string",
+          "maxLength": 500,
+          "description": "User caption describing the photo proof."
+        },
+        "fileName": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Original photo filename."
+        },
+        "storeLocation": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Store location copied from parent report for display."
+        },
+        "inspectionDate": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Inspection date copied from parent report."
+        },
+        "dataUrl": {
+          "type": "string",
+          "maxLength": 600000,
+          "description": "Compressed JPEG base64 data URL (strictly bounded <= 600KB)."
+        },
+        "capturedAt": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "ISO timestamp when photo was captured or attached."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when photo record was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when photo record was last updated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "reportId",
+        "itemNumber",
+        "sectionCode",
+        "sectionTitle",
+        "itemText",
+        "complied",
+        "deviation",
+        "caption",
+        "fileName",
+        "storeLocation",
+        "inspectionDate",
+        "dataUrl",
+        "capturedAt",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/reports/{reportId}": {
+      "schema": {
+        "$ref": "#/entities/InspectionReport"
+      },
+      "description": "Stores IQAF-005 Store Inspection Checklist reports owned by authenticated inspectors."
+    },
+    "/reports/{reportId}/photos/{photoId}": {
+      "schema": {
+        "$ref": "#/entities/InspectionPhoto"
+      },
+      "description": "Stores individual compressed photo proof documents belonging to a parent inspection report."
+    }
+  }
+}

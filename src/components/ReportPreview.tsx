@@ -4,21 +4,26 @@ import {
   Camera,
   CheckCircle2,
   Download,
+  FileSpreadsheet,
   Loader2,
+  Mail,
   Printer,
 } from 'lucide-react';
 import {
   ALL_CHECKLIST_ITEMS,
   CHECKLIST_SECTIONS,
   HOW_TO_FILL_INSTRUCTION,
+  IQAF_BASIS_STATEMENT,
   formatDisplayDate,
   formatDisplayTime,
+  formatReportNo,
 } from '../data/checklistData';
 import type {
   InspectionReport,
   PdfExportOptions,
   PhotoProof,
 } from '../types/inspection';
+import { formatTakenTimestamp } from '../utils/imageUtils';
 import { collectIndexedPhotos } from '../utils/pdfExporter';
 import { JiangNanLogo } from './JiangNanLogo';
 
@@ -26,8 +31,11 @@ interface ReportPreviewProps {
   report: InspectionReport;
   exportOptions: PdfExportOptions;
   onChangeExportOptions: (next: PdfExportOptions) => void;
+  onEmailReport: () => void;
   onExportPdf: () => Promise<void>;
+  onExportExcel: () => Promise<void>;
   isExporting: boolean;
+  isExportingExcel: boolean;
   onBackToForm: () => void;
   onInspectPhoto: (itemNumber: number, itemText: string, photo: PhotoProof) => void;
 }
@@ -36,13 +44,20 @@ export function ReportPreview({
   report,
   exportOptions,
   onChangeExportOptions,
+  onEmailReport,
   onExportPdf,
+  onExportExcel,
   isExporting,
+  isExportingExcel,
   onBackToForm,
   onInspectPhoto,
 }: ReportPreviewProps) {
   const [printHint, setPrintHint] = useState(false);
 
+  const reportNo = formatReportNo(
+    report.meta.storeLocation,
+    report.meta.dateOfInspection
+  );
   const indexedPhotos = useMemo(() => collectIndexedPhotos(report), [report]);
   const photoNumbersByItem = useMemo(() => {
     const map = new Map<number, number[]>();
@@ -59,17 +74,73 @@ export function ReportPreview({
     let no = 0;
     let na = 0;
     let unanswered = 0;
-    for (const item of ALL_CHECKLIST_ITEMS) {
-      const status = report.responses[item.number]?.complied || '';
-      if (status === 'Yes') yes++;
-      else if (status === 'No') no++;
-      else if (status === 'N/A') na++;
-      else unanswered++;
-    }
+
+    const categoryRows = CHECKLIST_SECTIONS.map((section) => {
+      let sYes = 0;
+      let sNo = 0;
+      let sNa = 0;
+      let sPending = 0;
+      let sPhotos = 0;
+
+      for (const item of section.items) {
+        const resp = report.responses[item.number];
+        const status = resp?.complied || '';
+        sPhotos += resp?.photos?.length ?? 0;
+
+        if (status === 'Yes') {
+          sYes++;
+          yes++;
+        } else if (status === 'No') {
+          sNo++;
+          no++;
+        } else if (status === 'N/A') {
+          sNa++;
+          na++;
+        } else {
+          sPending++;
+          unanswered++;
+        }
+      }
+
+      const sApplicable = sYes + sNo;
+      const score =
+        sApplicable > 0 ? Math.round((sYes / sApplicable) * 100) : null;
+      return {
+        code: section.code,
+        title: section.title,
+        total: section.items.length,
+        yes: sYes,
+        no: sNo,
+        na: sNa,
+        pending: sPending,
+        photos: sPhotos,
+        score,
+      };
+    });
+
+    const deviations = ALL_CHECKLIST_ITEMS.filter(
+      (item) => report.responses[item.number]?.complied === 'No'
+    ).map((item) => ({
+      item,
+      sectionTitle:
+        CHECKLIST_SECTIONS.find((s) => s.code === item.sectionCode)?.title ?? '',
+      response: report.responses[item.number],
+    }));
+
     const applicable = yes + no;
+    const answered = yes + no + na;
     const complianceRate =
       applicable > 0 ? Math.round((yes / applicable) * 100) : null;
-    return { yes, no, na, unanswered, complianceRate };
+    return {
+      yes,
+      no,
+      na,
+      unanswered,
+      answered,
+      complianceRate,
+      categoryRows,
+      deviations,
+    };
   }, [report.responses]);
 
   const handlePrint = () => {
@@ -105,7 +176,7 @@ export function ReportPreview({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={handlePrint}
@@ -113,6 +184,27 @@ export function ReportPreview({
             >
               <Printer className="w-3.5 h-3.5" />
               Print
+            </button>
+            <button
+              type="button"
+              onClick={onEmailReport}
+              className="inline-flex items-center gap-1.5 px-3.5 h-9 text-xs font-semibold text-slate-900 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap"
+            >
+              <Mail className="w-3.5 h-3.5 text-red-700" />
+              Email Report
+            </button>
+            <button
+              type="button"
+              onClick={onExportExcel}
+              disabled={isExportingExcel}
+              className="inline-flex items-center gap-1.5 px-3.5 h-9 text-xs font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 hover:bg-emerald-100 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
+            >
+              {isExportingExcel ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <FileSpreadsheet className="w-3.5 h-3.5" />
+              )}
+              {isExportingExcel ? 'Exporting…' : 'Export Excel'}
             </button>
             <button
               type="button"
@@ -186,38 +278,54 @@ export function ReportPreview({
             )}
           </div>
 
-          {indexedPhotos.length > 0 && (
-            <div className="flex flex-wrap items-center gap-4 text-xs text-slate-700">
-              <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={exportOptions.includePhotoAppendix}
-                  onChange={(e) =>
-                    onChangeExportOptions({
-                      ...exportOptions,
-                      includePhotoAppendix: e.target.checked,
-                    })
-                  }
-                  className="rounded border-slate-300 text-red-700 focus:ring-red-700"
-                />
-                <span>Photo Proof Appendix</span>
-              </label>
-              <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
-                <input
-                  type="checkbox"
-                  checked={exportOptions.includeInlineThumbnails}
-                  onChange={(e) =>
-                    onChangeExportOptions({
-                      ...exportOptions,
-                      includeInlineThumbnails: e.target.checked,
-                    })
-                  }
-                  className="rounded border-slate-300 text-red-700 focus:ring-red-700"
-                />
-                <span>Inline Thumbnails in Table</span>
-              </label>
-            </div>
-          )}
+          <div className="flex flex-wrap items-center gap-4 text-xs text-slate-700">
+            <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={exportOptions.includeSummary}
+                onChange={(e) =>
+                  onChangeExportOptions({
+                    ...exportOptions,
+                    includeSummary: e.target.checked,
+                  })
+                }
+                className="rounded border-slate-300 text-red-700 focus:ring-red-700"
+              />
+              <span>Inspection Summary</span>
+            </label>
+            {indexedPhotos.length > 0 && (
+              <>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={exportOptions.includePhotoAppendix}
+                    onChange={(e) =>
+                      onChangeExportOptions({
+                        ...exportOptions,
+                        includePhotoAppendix: e.target.checked,
+                      })
+                    }
+                    className="rounded border-slate-300 text-red-700 focus:ring-red-700"
+                  />
+                  <span>Photo Proof Appendix</span>
+                </label>
+                <label className="inline-flex items-center gap-1.5 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={exportOptions.includeInlineThumbnails}
+                    onChange={(e) =>
+                      onChangeExportOptions({
+                        ...exportOptions,
+                        includeInlineThumbnails: e.target.checked,
+                      })
+                    }
+                    className="rounded border-slate-300 text-red-700 focus:ring-red-700"
+                  />
+                  <span>Inline Thumbnails</span>
+                </label>
+              </>
+            )}
+          </div>
         </div>
 
         {printHint && (
@@ -309,9 +417,12 @@ export function ReportPreview({
           </tbody>
         </table>
 
-        {/* Exact Italic Instruction Line */}
-        <p className="italic text-[10px] text-zinc-800 my-2.5 leading-snug">
+        {/* Exact Italic Instruction Line & IQAF-005 Basis Statement */}
+        <p className="italic text-[10px] text-zinc-800 mt-2.5 mb-1 leading-snug">
           {HOW_TO_FILL_INSTRUCTION}
+        </p>
+        <p className="text-[9.5px] font-medium text-zinc-700 mb-2.5 leading-snug">
+          {IQAF_BASIS_STATEMENT}
         </p>
 
         {/* Main 67-Item Table */}
@@ -469,28 +580,307 @@ export function ReportPreview({
                   <div>Signature over printed name / Date</div>
                 </td>
                 <td className="py-1.5 px-2">
-                  <div>Restaurant / Shift Manager / Area Manager</div>
+                  <div>Restaurant / Shift Manager</div>
                   <div>Signature over printed name / Date</div>
                 </td>
                 <td className="py-1.5 px-2">
-                  <div>Immediate Manager</div>
+                  <div>Area Manager</div>
                   <div>Signature over printed name / Date</div>
                 </td>
               </tr>
             </tbody>
           </table>
 
-          <div className="mt-4 flex items-center justify-between text-[10.5px] text-zinc-900">
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-[10.5px] text-zinc-900">
             <span className="font-bold">Quality Assurance Department</span>
             <span>
-              Form #: {report.meta.documentationNo || 'IQAF-005'}
+              Basis Form #: {report.meta.documentationNo || 'IQAF-005'}
               <span className="inline-block w-4" />
               Revision No.: {report.meta.revisionNo || '0'}
             </span>
-            <span className="w-28 hidden sm:inline-block" aria-hidden="true" />
+          </div>
+
+          <div className="mt-3 pt-2 border-t border-zinc-300 flex flex-wrap items-center justify-between gap-2 text-[10px] text-zinc-700">
+            <span className="font-mono font-bold text-zinc-900 tabular-nums">
+              Report No.: {reportNo}
+            </span>
+            <span>
+              Basis: {report.meta.documentationNo || 'IQAF-005'} Store
+              Inspection Checklist
+            </span>
           </div>
         </div>
       </div>
+
+      {/* ===================================================================== */}
+      {/* INSPECTION SUMMARY SHEET (Exact IQAF-005 Styling)                     */}
+      {/* ===================================================================== */}
+      {exportOptions.includeSummary && (
+        <div className="iqaf-sheet iqaf-page-break bg-white border border-slate-300 shadow-sm mx-auto mt-6 p-6 sm:p-10 text-[11px] leading-[1.35]">
+          <table className="iqaf-table mb-4">
+            <colgroup>
+              <col style={{ width: '56.7%' }} />
+              <col style={{ width: '21.8%' }} />
+              <col style={{ width: '21.5%' }} />
+            </colgroup>
+            <tbody>
+              <tr>
+                <td rowSpan={2} className="px-3 py-2 bg-white">
+                  <div className="flex items-center justify-between gap-3">
+                    <JiangNanLogo compact />
+                    <div className="flex-1 text-center pr-2">
+                      <div className="font-bold text-[14px] text-zinc-950">
+                        Store Inspection Summary
+                      </div>
+                      <div className="text-[10px] text-zinc-600 mt-0.5">
+                        {[
+                          report.meta.storeLocation || 'Store Inspection',
+                          formatDisplayDate(report.meta.dateOfInspection),
+                          report.meta.inspectedBy
+                            ? `Inspector: ${report.meta.inspectedBy}`
+                            : '',
+                        ]
+                          .filter(Boolean)
+                          .join('  |  ')}
+                      </div>
+                    </div>
+                  </div>
+                </td>
+                <td className="px-2 py-1 text-right font-bold text-[10.5px]">
+                  Documentation No.:
+                </td>
+                <td className="px-2 py-1 text-left text-[10.5px] font-mono">
+                  {report.meta.documentationNo || 'IQAF-005'}
+                </td>
+              </tr>
+              <tr>
+                <td className="px-2 py-1 text-right font-bold text-[10.5px]">
+                  Revision No.:
+                </td>
+                <td className="px-2 py-1 text-left text-[10.5px] font-mono">
+                  {report.meta.revisionNo || '0'}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          {/* Overall Compliance Summary Table */}
+          <table className="iqaf-table mb-4">
+            <thead>
+              <tr className="bg-[#404040] text-white font-bold text-[11px]">
+                <th colSpan={6} className="py-1.5 px-2 text-left">
+                  Overall Compliance Summary
+                </th>
+              </tr>
+            </thead>
+            <tbody className="tabular-nums">
+              <tr>
+                <td className="px-2 py-1.5 font-bold bg-[#EFEFEF]">
+                  Compliance Rate
+                </td>
+                <td className="px-2 py-1.5 text-center font-bold">
+                  {stats.complianceRate !== null
+                    ? `${stats.complianceRate}%`
+                    : '—'}
+                </td>
+                <td className="px-2 py-1.5 font-bold bg-[#EFEFEF]">
+                  Items Checked
+                </td>
+                <td className="px-2 py-1.5 text-center">
+                  {stats.answered} / {ALL_CHECKLIST_ITEMS.length}
+                </td>
+                <td className="px-2 py-1.5 font-bold bg-[#EFEFEF]">
+                  Photo Proofs
+                </td>
+                <td className="px-2 py-1.5 text-center">
+                  {indexedPhotos.length}
+                </td>
+              </tr>
+              <tr>
+                <td className="px-2 py-1.5 font-bold bg-[#EFEFEF]">
+                  Complied (Yes)
+                </td>
+                <td className="px-2 py-1.5 text-center font-bold text-emerald-800">
+                  {stats.yes}
+                </td>
+                <td className="px-2 py-1.5 font-bold bg-[#EFEFEF]">
+                  Deviations (No)
+                </td>
+                <td
+                  className={`px-2 py-1.5 text-center font-bold ${
+                    stats.no > 0 ? 'text-red-700' : 'text-zinc-900'
+                  }`}
+                >
+                  {stats.no}
+                </td>
+                <td className="px-2 py-1.5 font-bold bg-[#EFEFEF]">
+                  N/A / Pending
+                </td>
+                <td className="px-2 py-1.5 text-center">
+                  {stats.na} N/A · {stats.unanswered} Pending
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          {/* Category-by-Category Breakdown Table */}
+          <table className="iqaf-table mb-4">
+            <colgroup>
+              <col style={{ width: '44%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '8%' }} />
+              <col style={{ width: '8%' }} />
+            </colgroup>
+            <thead>
+              <tr className="bg-[#404040] text-white font-bold text-[10.5px]">
+                <th className="py-1.5 px-2 text-left">Category (Sections A–Q)</th>
+                <th className="py-1.5 px-1 text-center">Items</th>
+                <th className="py-1.5 px-1 text-center">Yes</th>
+                <th className="py-1.5 px-1 text-center">No</th>
+                <th className="py-1.5 px-1 text-center">N/A</th>
+                <th className="py-1.5 px-1 text-center">Pending</th>
+                <th className="py-1.5 px-1 text-center">Photos</th>
+                <th className="py-1.5 px-1 text-center">Score</th>
+              </tr>
+            </thead>
+            <tbody className="tabular-nums text-[10.5px]">
+              {stats.categoryRows.map((row) => (
+                <tr key={row.code}>
+                  <td className="px-2 py-1 text-left">
+                    <span className="font-bold">{row.code}.</span> {row.title}
+                  </td>
+                  <td className="px-1 py-1 text-center">{row.total}</td>
+                  <td className="px-1 py-1 text-center text-emerald-800 font-semibold">
+                    {row.yes}
+                  </td>
+                  <td
+                    className={`px-1 py-1 text-center ${
+                      row.no > 0 ? 'text-red-700 font-bold' : ''
+                    }`}
+                  >
+                    {row.no}
+                  </td>
+                  <td className="px-1 py-1 text-center">{row.na}</td>
+                  <td className="px-1 py-1 text-center">{row.pending}</td>
+                  <td className="px-1 py-1 text-center">{row.photos}</td>
+                  <td className="px-1 py-1 text-center font-bold">
+                    {row.score !== null ? `${row.score}%` : '—'}
+                  </td>
+                </tr>
+              ))}
+              <tr className="bg-[#D9D9D9] font-bold">
+                <td className="px-2 py-1.5 text-left">
+                  Total (All 17 Categories)
+                </td>
+                <td className="px-1 py-1.5 text-center">
+                  {ALL_CHECKLIST_ITEMS.length}
+                </td>
+                <td className="px-1 py-1.5 text-center text-emerald-800">
+                  {stats.yes}
+                </td>
+                <td
+                  className={`px-1 py-1.5 text-center ${
+                    stats.no > 0 ? 'text-red-700' : ''
+                  }`}
+                >
+                  {stats.no}
+                </td>
+                <td className="px-1 py-1.5 text-center">{stats.na}</td>
+                <td className="px-1 py-1.5 text-center">{stats.unanswered}</td>
+                <td className="px-1 py-1.5 text-center">
+                  {indexedPhotos.length}
+                </td>
+                <td className="px-1 py-1.5 text-center">
+                  {stats.complianceRate !== null
+                    ? `${stats.complianceRate}%`
+                    : '—'}
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
+          {/* Consolidated Deviations & Corrective Actions Table */}
+          <table className="iqaf-table">
+            <colgroup>
+              <col style={{ width: '6%' }} />
+              <col style={{ width: '32%' }} />
+              <col style={{ width: '26%' }} />
+              <col style={{ width: '26%' }} />
+              <col style={{ width: '10%' }} />
+            </colgroup>
+            <thead>
+              <tr className="bg-[#404040] text-white font-bold text-[10.5px]">
+                <th colSpan={5} className="py-1.5 px-2 text-left">
+                  Summary of Deviations &amp; Corrective Actions (
+                  {stats.deviations.length})
+                </th>
+              </tr>
+              <tr className="bg-[#D9D9D9] text-zinc-950 font-bold text-[10px]">
+                <th className="py-1 px-1 text-center">No.</th>
+                <th className="py-1 px-2 text-left">Category &amp; Item</th>
+                <th className="py-1 px-2 text-left">Deviation / Findings</th>
+                <th className="py-1 px-2 text-left">Corrective Action</th>
+                <th className="py-1 px-1 text-center">Photos</th>
+              </tr>
+            </thead>
+            <tbody className="text-[10.5px]">
+              {stats.deviations.length === 0 ? (
+                <tr>
+                  <td
+                    colSpan={5}
+                    className="py-3 px-2 text-center italic text-zinc-600"
+                  >
+                    No non-compliant items (&ldquo;No&rdquo;) were recorded
+                    during this inspection.
+                  </td>
+                </tr>
+              ) : (
+                stats.deviations.map(({ item, sectionTitle, response }) => {
+                  const pNums = photoNumbersByItem.get(item.number) ?? [];
+                  return (
+                    <tr key={item.number} className="align-top">
+                      <td className="px-1 py-1.5 text-center font-bold text-red-700 tabular-nums">
+                        {item.number}
+                      </td>
+                      <td className="px-2 py-1.5">
+                        <div className="font-bold text-[9.5px] text-zinc-700">
+                          {item.sectionCode}. {sectionTitle}
+                        </div>
+                        <div>{item.text}</div>
+                      </td>
+                      <td className="px-2 py-1.5 whitespace-pre-wrap break-words">
+                        {response?.deviation?.trim() || '—'}
+                      </td>
+                      <td className="px-2 py-1.5 whitespace-pre-wrap break-words">
+                        {response?.correctiveAction?.trim() || '—'}
+                      </td>
+                      <td className="px-1 py-1.5 text-center font-mono text-[10px]">
+                        {pNums.length > 0
+                          ? pNums.map((n) => `#${n}`).join(', ')
+                          : '—'}
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
+            </tbody>
+          </table>
+
+          <div className="mt-5 pt-2 border-t border-zinc-300 flex flex-wrap items-center justify-between gap-2 text-[10px] text-zinc-700">
+            <span className="font-mono font-bold text-zinc-900 tabular-nums">
+              Report No.: {reportNo}
+            </span>
+            <span>
+              Basis: {report.meta.documentationNo || 'IQAF-005'} Store
+              Inspection Checklist
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* ===================================================================== */}
       {/* PHOTO PROOF & EVIDENCE ATTACHMENT SHEET (Rendered when photos exist)  */}
@@ -603,12 +993,21 @@ export function ReportPreview({
                     )}
                   </div>
                   <div className="text-[9.5px] text-zinc-500 font-mono tabular-nums pt-1 border-t border-slate-100">
-                    Captured:{' '}
-                    {new Date(entry.photo.capturedAt).toLocaleString()}
+                    Taken: {formatTakenTimestamp(entry.photo.capturedAt)}
                   </div>
                 </div>
               </div>
             ))}
+          </div>
+
+          <div className="mt-5 pt-2 border-t border-zinc-300 flex flex-wrap items-center justify-between gap-2 text-[10px] text-zinc-700">
+            <span className="font-mono font-bold text-zinc-900 tabular-nums">
+              Report No.: {reportNo}
+            </span>
+            <span>
+              Basis: {report.meta.documentationNo || 'IQAF-005'} Store
+              Inspection Checklist
+            </span>
           </div>
         </div>
       )}
@@ -635,20 +1034,43 @@ export function ReportPreview({
       )}
 
       {/* Ready indicator below paper */}
-      <div className="no-print mt-5 flex items-center justify-between text-xs text-slate-500">
+      <div className="no-print mt-5 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
         <span className="inline-flex items-center gap-1.5">
           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" />
-          Exported PDF automatically includes repeating dark headers and page
-          numbers (Page X of Y).
+          Export as formatted PDF or multi-sheet Excel (.xlsx) workbook with
+          live compliance formulas and CAPA register.
         </span>
-        <button
-          type="button"
-          onClick={onExportPdf}
-          disabled={isExporting}
-          className="font-semibold text-red-700 hover:text-red-800 whitespace-nowrap"
-        >
-          {isExporting ? 'Exporting…' : 'Download PDF File'}
-        </button>
+        <div className="flex items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={onEmailReport}
+            className="font-semibold text-slate-800 hover:text-slate-950 whitespace-nowrap"
+          >
+            Email Report
+          </button>
+          <span className="text-slate-300" aria-hidden="true">
+            ·
+          </span>
+          <button
+            type="button"
+            onClick={onExportExcel}
+            disabled={isExportingExcel}
+            className="font-semibold text-emerald-800 hover:text-emerald-900 whitespace-nowrap"
+          >
+            {isExportingExcel ? 'Exporting…' : 'Download Excel (.xlsx)'}
+          </button>
+          <span className="text-slate-300" aria-hidden="true">
+            ·
+          </span>
+          <button
+            type="button"
+            onClick={onExportPdf}
+            disabled={isExporting}
+            className="font-semibold text-red-700 hover:text-red-800 whitespace-nowrap"
+          >
+            {isExporting ? 'Exporting…' : 'Download PDF File'}
+          </button>
+        </div>
       </div>
     </div>
   );

@@ -1,68 +1,46 @@
+import { useState } from 'react';
+
+export const JIANG_NAN_LOGO_SRC =
+  '/assets/aistudio/JN_LOGO_LANDSCAPE_25408581.png';
+
 interface JiangNanLogoProps {
   className?: string;
   compact?: boolean;
 }
 
-export function JiangNanLogo({ className = '', compact = false }: JiangNanLogoProps) {
+export function JiangNanLogo({
+  className = '',
+  compact = false,
+}: JiangNanLogoProps) {
+  const [imgFailed, setImgFailed] = useState(false);
+
+  if (imgFailed) {
+    return (
+      <span
+        className={`inline-flex items-center font-bold tracking-wider text-zinc-900 select-none ${
+          compact ? 'text-xs' : 'text-sm'
+        } ${className}`}
+      >
+        JIANG NAN
+      </span>
+    );
+  }
+
   return (
     <div
-      className={`inline-flex items-center select-none ${compact ? 'gap-1' : 'gap-1.5'} ${className}`}
-      aria-label="Jiang Nan"
+      className={`inline-flex items-center overflow-hidden shrink-0 select-none ${
+        compact ? 'h-8' : 'h-10'
+      } ${className}`}
     >
-      <span
-        className={`font-bold tracking-wider text-zinc-900 ${
-          compact ? 'text-[11px]' : 'text-[13px]'
+      <img
+        src={JIANG_NAN_LOGO_SRC}
+        alt="Jiang Nan"
+        referrerPolicy="no-referrer"
+        onError={() => setImgFailed(true)}
+        className={`w-auto object-contain block ${
+          compact ? 'h-12 -my-2' : 'h-16 -my-3'
         }`}
-        style={{ fontFamily: 'Georgia, "Times New Roman", serif' }}
-      >
-        JIANG
-      </span>
-      <svg
-        viewBox="0 0 36 36"
-        className={compact ? 'w-6 h-6 shrink-0' : 'w-8 h-8 shrink-0'}
-        aria-hidden="true"
-      >
-        <circle cx="18" cy="18" r="17" fill="#B91C1C" />
-        <circle
-          cx="18"
-          cy="18"
-          r="14.5"
-          fill="none"
-          stroke="#FFFFFF"
-          strokeWidth="1.2"
-          strokeOpacity="0.92"
-        />
-        <text
-          x="18"
-          y="15.2"
-          textAnchor="middle"
-          fill="#FFFFFF"
-          fontSize="11.5"
-          fontWeight="700"
-          fontFamily='"Noto Serif SC", "Songti SC", "SimSun", serif'
-        >
-          江
-        </text>
-        <text
-          x="18"
-          y="27.2"
-          textAnchor="middle"
-          fill="#FFFFFF"
-          fontSize="11.5"
-          fontWeight="700"
-          fontFamily='"Noto Serif SC", "Songti SC", "SimSun", serif'
-        >
-          南
-        </text>
-      </svg>
-      <span
-        className={`font-bold tracking-wider text-zinc-900 ${
-          compact ? 'text-[11px]' : 'text-[13px]'
-        }`}
-        style={{ fontFamily: 'Georgia, "Times New Roman", serif' }}
-      >
-        NAN
-      </span>
+      />
     </div>
   );
 }

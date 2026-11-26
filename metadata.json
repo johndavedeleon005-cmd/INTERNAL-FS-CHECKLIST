@@ -1,6 +1,10 @@
 {
   "name": "IQAF-005 Store Inspection Checklist",
   "description": "Digital store compliance inspection form with photo proof attachments, electronic sign-off, exact IQAF-005 checklist report preview, and PDF export.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

@@ -1,11 +1,16 @@
 export type ComplianceStatus = 'Yes' | 'No' | 'N/A' | '';
 
+export type PhotoUploadState = 'uploading' | 'synced' | 'local' | 'error';
+
 export interface PhotoProof {
   id: string;
   dataUrl: string;
   caption: string;
   capturedAt: string;
   fileName: string;
+  takenAtSource?: 'camera' | 'exif' | 'file' | 'now';
+  uploadState?: PhotoUploadState;
+  uploadError?: string;
 }
 
 export interface ItemResponse {
@@ -56,7 +61,25 @@ export interface InspectionReport {
   signOffs: InspectionSignOffs;
 }
 
+export interface StoredPhotoRecord {
+  id: string;
+  reportId: string;
+  storeLocation: string;
+  inspectionDate: string;
+  itemNumber: number;
+  sectionCode: string;
+  sectionTitle: string;
+  itemText: string;
+  complied: ComplianceStatus;
+  deviation: string;
+  caption: string;
+  capturedAt: string;
+  fileName: string;
+  dataUrl: string;
+}
+
 export interface PdfExportOptions {
+  includeSummary: boolean;
   includePhotoAppendix: boolean;
   includeInlineThumbnails: boolean;
 }

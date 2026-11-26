@@ -5,8 +5,13 @@ import {
   Check,
   ChevronDown,
   ChevronUp,
+  Clock,
+  CloudCheck,
+  HardDrive,
   ImagePlus,
+  Loader2,
   Minus,
+  RotateCw,
   Trash2,
   X,
 } from 'lucide-react';
@@ -16,12 +21,22 @@ import type {
   ItemResponse,
   PhotoProof,
 } from '../types/inspection';
-import { compressImageFile } from '../utils/imageUtils';
+import {
+  compressImageFile,
+  extractPhotoTakenTimestamp,
+  formatTakenTimestamp,
+  isSupportedImageFile,
+} from '../utils/imageUtils';
 
 interface InspectionItemRowProps {
   item: ChecklistItemDef;
   response: ItemResponse;
   onChange: (next: ItemResponse) => void;
+  onOpenCamera: () => void;
+  onAddPhotos: (photos: PhotoProof[]) => void;
+  onRetryPhotoUpload: (photoId: string) => void;
+  onRemovePhoto: (photoId: string) => void;
+  onUpdatePhotoCaption: (photoId: string, caption: string) => void;
   onInspectPhoto: (photo: PhotoProof) => void;
 }
 
@@ -38,12 +53,17 @@ export function InspectionItemRow({
   item,
   response,
   onChange,
+  onOpenCamera,
+  onAddPhotos,
+  onRetryPhotoUpload,
+  onRemovePhoto,
+  onUpdatePhotoCaption,
   onInspectPhoto,
 }: InspectionItemRowProps) {
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const galleryInputRef = useRef<HTMLInputElement | null>(null);
   const [notesExpanded, setNotesExpanded] = useState(false);
-  const [isUploading, setIsUploading] = useState(false);
-  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [isProcessingFiles, setIsProcessingFiles] = useState(false);
+  const [processError, setProcessError] = useState<string | null>(null);
 
   const isNonCompliant = response.complied === 'No';
   const hasNotes =
@@ -63,57 +83,64 @@ export function InspectionItemRow({
     });
   };
 
-  const handleFileSelection = async (
+  const handleGallerySelection = async (
     e: React.ChangeEvent<HTMLInputElement>
   ) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    setIsUploading(true);
-    setUploadError(null);
+    setIsProcessingFiles(true);
+    setProcessError(null);
+    const added: PhotoProof[] = [];
+    let failedCount = 0;
+
     try {
-      const added: PhotoProof[] = [];
       for (const file of Array.from(files)) {
-        if (!file.type.startsWith('image/')) continue;
-        const dataUrl = await compressImageFile(file);
-        added.push({
-          id: `ph-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-          dataUrl,
-          caption: '',
-          capturedAt: new Date().toISOString(),
-          fileName: file.name || `item-${item.number}-proof.jpg`,
-        });
+        if (!isSupportedImageFile(file)) {
+          failedCount++;
+          continue;
+        }
+        try {
+          const [dataUrl, taken] = await Promise.all([
+            compressImageFile(file),
+            extractPhotoTakenTimestamp(file, false),
+          ]);
+          added.push({
+            id: `ph-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            dataUrl,
+            caption: '',
+            capturedAt: taken.iso,
+            takenAtSource: taken.source,
+            fileName: file.name || `item-${item.number}-proof.jpg`,
+          });
+        } catch {
+          failedCount++;
+        }
       }
+
       if (added.length > 0) {
-        onChange({
-          ...response,
-          photos: [...response.photos, ...added],
-        });
+        onAddPhotos(added);
       }
-    } catch {
-      setUploadError('Could not process one or more photos. Please try another image.');
+      if (failedCount > 0) {
+        setProcessError(
+          failedCount === 1
+            ? '1 selected file could not be read as an image (try JPG, PNG, or WebP).'
+            : `${failedCount} selected files could not be read as images (try JPG, PNG, or WebP).`
+        );
+      }
     } finally {
-      setIsUploading(false);
-      if (fileInputRef.current) {
-        fileInputRef.current.value = '';
+      setIsProcessingFiles(false);
+      if (galleryInputRef.current) {
+        galleryInputRef.current.value = '';
       }
     }
   };
 
-  const handleRemovePhoto = (photoId: string) => {
-    onChange({
-      ...response,
-      photos: response.photos.filter((p) => p.id !== photoId),
-    });
-  };
-
-  const handleUpdateCaption = (photoId: string, caption: string) => {
-    onChange({
-      ...response,
-      photos: response.photos.map((p) =>
-        p.id === photoId ? { ...p, caption } : p
-      ),
-    });
+  const sourceHint = (source?: PhotoProof['takenAtSource']) => {
+    if (source === 'exif') return 'EXIF';
+    if (source === 'camera') return 'Camera';
+    if (source === 'file') return 'File';
+    return null;
   };
 
   return (
@@ -123,8 +150,8 @@ export function InspectionItemRow({
         isNonCompliant ? 'bg-red-50/40' : 'bg-white hover:bg-slate-50/50'
       }`}
     >
-      {/* Main row: Number + Inspection Item + Complied Controls + Photo Button */}
-      <div className="flex flex-col lg:flex-row lg:items-start gap-3 lg:gap-5">
+      {/* Main row: Number + Inspection Item + Complied Controls + Camera/Gallery */}
+      <div className="flex flex-col lg:flex-row lg:items-start gap-3 lg:gap-4">
         <div className="flex items-start gap-3 flex-1 min-w-0">
           <span className="font-mono text-xs font-semibold text-slate-500 tabular-nums pt-0.5 w-6 shrink-0">
             {String(item.number).padStart(2, '0')}
@@ -162,15 +189,17 @@ export function InspectionItemRow({
               {response.photos.length > 0 && (
                 <span className="font-mono tabular-nums text-slate-600">
                   {response.photos.length}{' '}
-                  {response.photos.length === 1 ? 'photo attached' : 'photos attached'}
+                  {response.photos.length === 1
+                    ? 'photo attached'
+                    : 'photos attached'}
                 </span>
               )}
             </div>
           </div>
         </div>
 
-        {/* Right Controls: Yes / No / N/A Segmented Control + Add Photo */}
-        <div className="flex items-center justify-between sm:justify-end gap-2.5 pl-9 lg:pl-0 shrink-0">
+        {/* Right Controls: Yes / No / N/A Segmented Control + Camera & Gallery */}
+        <div className="flex flex-wrap items-center justify-between sm:justify-end gap-2 pl-9 lg:pl-0 shrink-0">
           <div
             role="radiogroup"
             aria-label={`Item ${item.number} compliance`}
@@ -210,31 +239,43 @@ export function InspectionItemRow({
           </div>
 
           <input
-            ref={fileInputRef}
+            ref={galleryInputRef}
             type="file"
             accept="image/*"
             multiple
-            onChange={handleFileSelection}
+            onChange={handleGallerySelection}
             className="hidden"
           />
-          <button
-            type="button"
-            disabled={isUploading}
-            onClick={() => fileInputRef.current?.click()}
-            className={`inline-flex items-center gap-1.5 h-10 px-3 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
-              response.photos.length > 0
-                ? 'border-slate-300 bg-slate-100 text-slate-900 hover:bg-slate-200/80'
-                : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50'
-            }`}
-            title="Attach photo proof from camera or gallery"
-          >
-            {response.photos.length > 0 ? (
-              <ImagePlus className="w-4 h-4 text-slate-700" />
-            ) : (
-              <Camera className="w-4 h-4 text-slate-500" />
-            )}
-            <span>{isUploading ? 'Adding…' : 'Photo'}</span>
-          </button>
+
+          <div className="inline-flex items-center gap-1.5">
+            <button
+              type="button"
+              onClick={onOpenCamera}
+              className="inline-flex items-center gap-1.5 h-10 px-2.5 text-xs font-medium rounded-lg border border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
+              title="Take a photo with camera"
+            >
+              <Camera className="w-3.5 h-3.5 text-slate-600" />
+              <span>Camera</span>
+            </button>
+            <button
+              type="button"
+              disabled={isProcessingFiles}
+              onClick={() => galleryInputRef.current?.click()}
+              className={`inline-flex items-center gap-1.5 h-10 px-2.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap shrink-0 disabled:opacity-60 ${
+                response.photos.length > 0
+                  ? 'border-slate-300 bg-slate-100 text-slate-900 hover:bg-slate-200/80'
+                  : 'border-slate-200 bg-white text-slate-700 hover:border-slate-300 hover:bg-slate-50'
+              }`}
+              title="Import one or more photos from gallery"
+            >
+              {isProcessingFiles ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-600" />
+              ) : (
+                <ImagePlus className="w-3.5 h-3.5 text-slate-600" />
+              )}
+              <span>{isProcessingFiles ? 'Adding…' : 'Gallery'}</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -294,62 +335,114 @@ export function InspectionItemRow({
         </div>
       )}
 
-      {uploadError && (
-        <p className="mt-2 pl-9 text-xs text-red-700">{uploadError}</p>
+      {processError && (
+        <p className="mt-2 pl-9 text-xs text-red-700">{processError}</p>
       )}
 
       {/* Photo Proof Strip */}
       {response.photos.length > 0 && (
         <div className="mt-3 pl-0 sm:pl-9">
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-            {response.photos.map((photo, index) => (
-              <div
-                key={photo.id}
-                className="flex items-start gap-2.5 p-2 bg-slate-50 border border-slate-200 rounded-md"
-              >
-                <button
-                  type="button"
-                  onClick={() => onInspectPhoto(photo)}
-                  className="w-14 h-14 rounded overflow-hidden bg-slate-200 shrink-0 border border-slate-200 hover:opacity-90 transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-700"
-                  title="Click to enlarge photo"
+            {response.photos.map((photo, index) => {
+              const hint = sourceHint(photo.takenAtSource);
+              return (
+                <div
+                  key={photo.id}
+                  className={`flex items-start gap-2.5 p-2.5 border rounded-md ${
+                    photo.uploadState === 'error'
+                      ? 'bg-red-50/60 border-red-200'
+                      : 'bg-slate-50 border-slate-200'
+                  }`}
                 >
-                  <img
-                    src={photo.dataUrl}
-                    alt={photo.caption || `Item ${item.number} photo ${index + 1}`}
-                    referrerPolicy="no-referrer"
-                    className="w-full h-full object-cover"
-                  />
-                </button>
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center justify-between gap-1">
-                    <span className="text-[11px] font-mono text-slate-500 tabular-nums truncate">
-                      Proof {index + 1} ·{' '}
-                      {new Date(photo.capturedAt).toLocaleTimeString([], {
-                        hour: '2-digit',
-                        minute: '2-digit',
-                      })}
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => handleRemovePhoto(photo.id)}
-                      className="p-1 text-slate-400 hover:text-red-700 rounded transition-colors"
-                      aria-label="Delete photo proof"
-                    >
-                      <Trash2 className="w-3.5 h-3.5" />
-                    </button>
+                  <button
+                    type="button"
+                    onClick={() => onInspectPhoto(photo)}
+                    className="w-16 h-16 rounded overflow-hidden bg-slate-200 shrink-0 border border-slate-200 hover:opacity-90 transition-opacity focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-700"
+                    title="Click to enlarge photo"
+                  >
+                    <img
+                      src={photo.dataUrl}
+                      alt={
+                        photo.caption ||
+                        `Item ${item.number} photo ${index + 1}`
+                      }
+                      referrerPolicy="no-referrer"
+                      className="w-full h-full object-cover"
+                    />
+                  </button>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center justify-between gap-1">
+                      <span className="text-[11px] font-mono font-semibold text-slate-700 tabular-nums truncate">
+                        Proof {index + 1}
+                        {hint ? ` · ${hint}` : ''}
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => onRemovePhoto(photo.id)}
+                        className="p-1 text-slate-400 hover:text-red-700 rounded transition-colors shrink-0"
+                        aria-label="Delete photo proof"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    <div className="flex items-center gap-1 text-[10.5px] font-mono text-slate-500 tabular-nums mt-0.5 truncate">
+                      <Clock className="w-3 h-3 shrink-0 text-slate-400" />
+                      <span className="truncate">
+                        {formatTakenTimestamp(photo.capturedAt)}
+                      </span>
+                    </div>
+
+                    {/* Immediate Upload Status */}
+                    <div className="mt-1 flex items-center gap-1.5 text-[10.5px]">
+                      {photo.uploadState === 'uploading' && (
+                        <span className="inline-flex items-center gap-1 text-slate-600 font-medium">
+                          <Loader2 className="w-3 h-3 animate-spin" />
+                          Uploading online…
+                        </span>
+                      )}
+                      {photo.uploadState === 'synced' && (
+                        <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
+                          <CloudCheck className="w-3 h-3" />
+                          Saved online
+                        </span>
+                      )}
+                      {photo.uploadState === 'local' && (
+                        <span className="inline-flex items-center gap-1 text-slate-500">
+                          <HardDrive className="w-3 h-3" />
+                          Saved locally
+                        </span>
+                      )}
+                      {photo.uploadState === 'error' && (
+                        <div className="flex items-center gap-2 text-red-700 font-medium">
+                          <span className="truncate">
+                            {photo.uploadError || 'Upload failed'}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => onRetryPhotoUpload(photo.id)}
+                            className="inline-flex items-center gap-1 underline hover:text-red-900 shrink-0"
+                          >
+                            <RotateCw className="w-3 h-3" />
+                            Retry
+                          </button>
+                        </div>
+                      )}
+                    </div>
+
+                    <input
+                      type="text"
+                      value={photo.caption}
+                      onChange={(e) =>
+                        onUpdatePhotoCaption(photo.id, e.target.value)
+                      }
+                      placeholder="Add photo caption…"
+                      className="mt-1.5 w-full h-7 px-2 text-xs bg-white border border-slate-200 rounded text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-red-700"
+                    />
                   </div>
-                  <input
-                    type="text"
-                    value={photo.caption}
-                    onChange={(e) =>
-                      handleUpdateCaption(photo.id, e.target.value)
-                    }
-                    placeholder="Add photo caption…"
-                    className="mt-1 w-full h-7 px-2 text-xs bg-white border border-slate-200 rounded text-slate-800 placeholder:text-slate-400 focus:outline-none focus:border-red-700"
-                  />
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
