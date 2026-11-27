@@ -72,7 +72,9 @@ export interface InspectionMeta {
   revisionNo: string;
   dateOfInspection: string;
   storeLocation: string;
+  reportSequence?: number;
   timeOfInspection: string;
+  timeOfInspectionEnded?: string;
   inspectedBy: string;
 }
 
@@ -82,10 +84,19 @@ export interface SignOffEntry {
   signatureDataUrl: string | null;
 }
 
+export type SignOffRoleKey =
+  | 'performedBy'
+  | 'acknowledgedBy'
+  | 'notedBy'
+  | 'reviewedBy'
+  | 'approvedBy';
+
 export interface InspectionSignOffs {
   performedBy: SignOffEntry;
   acknowledgedBy: SignOffEntry;
   notedBy: SignOffEntry;
+  reviewedBy: SignOffEntry;
+  approvedBy: SignOffEntry;
 }
 
 export interface InspectionReport {
@@ -117,4 +128,36 @@ export interface PdfExportOptions {
   includeSummary: boolean;
   includePhotoAppendix: boolean;
   includeInlineThumbnails: boolean;
+  includeConfidentialWatermark?: boolean;
 }
+
+export type ReportAccessRole = 'owner' | 'editor' | 'viewer';
+export type ShareLinkRole = 'none' | 'viewer' | 'editor';
+
+export interface ReportCollaborationInfo {
+  ownerId: string;
+  ownerName: string;
+  accessRole: ReportAccessRole;
+  sharedWithEmails: string[];
+  editorEmails: string[];
+  activeShareLinkId: string | null;
+  activeShareRole: ShareLinkRole;
+  syncVersion: number;
+  lastEditedByUid: string;
+  lastEditedByName: string;
+  photoIds: string[];
+}
+
+export interface ShareLinkPreview {
+  shareId: string;
+  ownerId: string;
+  ownerName: string;
+  reportId: string;
+  documentationNo: string;
+  storeLocation: string;
+  dateOfInspection: string;
+  reportSequence?: number;
+  role: 'viewer' | 'editor';
+  active: boolean;
+}
+

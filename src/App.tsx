@@ -1,39 +1,61 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { onAuthStateChanged, type User } from 'firebase/auth';
 import {
   BarChart3,
   Camera,
   CheckCheck,
+  Clock,
   Cloud,
+  CopyPlus,
   Download,
+  Eye,
   FileCheck2,
   FilePlus2,
   FileSpreadsheet,
+  FileText,
   FolderKanban,
   Images,
+  LayoutDashboard,
+  Link2,
   Loader2,
   LogIn,
+  LogOut,
   Mail,
   Menu,
+  RefreshCw,
   Save,
   Search,
+  Share2,
   Sparkles,
+  WifiOff,
   X,
 } from 'lucide-react';
 import {
   ALL_CHECKLIST_ITEMS,
   CHECKLIST_SECTIONS,
+  CUSTOM_BRANCH_OPTION,
+  FACILITY_BRANCHES,
   HOW_TO_FILL_INSTRUCTION,
   IQAF_BASIS_STATEMENT,
+  REPORT_CONFIDENTIALITY_NOTICE,
+  STORE_BRANCHES,
   TOTAL_ITEMS_COUNT,
+  computeNextBranchReportSequence,
   createBlankInspection,
   createEmptyResponse,
   createSampleInspection,
   formatReportNo,
+  getCurrentTimeString,
+  getInspectionShortYear,
+  isPresetBranch,
+  normalizeBranchName,
+  resolveReportSequenceMap,
+  type ReportSequenceRecord,
 } from './data/checklistData';
 import {
   auth,
   extractFirebaseErrorDetails,
+  getOrCreatePublicInspectorId,
   signInWithGoogle,
   signOutUser,
 } from './firebase';
@@ -44,48 +66,103 @@ import type {
   PhotoProof,
   PhotoUploadAttemptLog,
   PhotoUploadDiagnostic,
+  ReportCollaborationInfo,
+  SignOffEntry,
+  SignOffRoleKey,
   StoredPhotoRecord,
 } from './types/inspection';
 import {
   type CloudReportSummary,
+  type ReportDirtyDelta,
   autosaveReportDocumentOnline,
+  claimShareLinkOnline,
   clearCloudReportCache,
+  deletePhotosBatchOnline,
   deleteReportOnline,
   deleteSinglePhotoOnline,
+  duplicateReportOnline,
+  leaveSharedReportOnline,
   loadAllUserPhotosOnline,
   loadReportWithPhotosOnline,
   sanitizeId,
   saveReportOnline,
+  subscribeToActiveReport,
+  subscribeToSharedReports,
   subscribeToUserReports,
   updatePhotoCaptionOnline,
+  updatePhotosCaptionBatchOnline,
   uploadSinglePhotoImmediatelyOnline,
 } from './utils/cloudReports';
-import { formatTakenTimestamp } from './utils/imageUtils';
-import { exportInspectionToExcel } from './utils/excelExporter';
-import { collectIndexedPhotos, exportInspectionToPdf } from './utils/pdfExporter';
+import {
+  formatTakenTimestamp,
+  getHdUploadsPreference,
+  setHdUploadsPreference,
+} from './utils/imageUtils';
+import {
+  exportBlankChecklistDocx,
+  exportInspectionToDocx,
+} from './utils/docxExporter';
+import {
+  exportBlankChecklistExcel,
+  exportInspectionToExcel,
+} from './utils/excelExporter';
+import {
+  collectIndexedPhotos,
+  exportBlankChecklistPdf,
+  exportInspectionToPdf,
+  exportMergedReportsToPdf,
+} from './utils/pdfExporter';
+import {
+  type BackgroundSyncPhotoItem,
+  type BackgroundSyncState,
+  INITIAL_BACKGROUND_SYNC_STATE,
+  PhotoBackgroundSyncService,
+} from './utils/photoBackgroundSync';
 import {
   deleteSavedReportFromDb,
   deleteStoredPhotoFromDb,
+  extractPhotoRecordsFromReport,
+  isLocalStorageQuotaError,
   loadActiveDraftFromDb,
   loadAllStoredPhotosFromDb,
+  loadDraftSyncStateFromDb,
   loadSavedReportsFromDb,
   saveActiveDraftToDb,
+  saveDraftSyncStateToDb,
   saveReportSnapshotToDb,
+  upsertStoredPhotoInDb,
 } from './utils/storageDb';
+import { AuthGateScreen } from './components/AuthGateScreen';
+import { BlankSheetMenuButton } from './components/BlankSheetMenuButton';
+import { BranchDashboardView } from './components/BranchDashboardView';
 import { CameraCaptureModal } from './components/CameraCaptureModal';
 import { EmailReportModal } from './components/EmailReportModal';
 import { InspectionItemRow } from './components/InspectionItemRow';
 import { InspectionSummaryView } from './components/InspectionSummaryView';
 import { JiangNanLogo } from './components/JiangNanLogo';
-import { NetworkStatusIndicator } from './components/NetworkStatusIndicator';
+import {
+  type CloudSaveErrorInfo,
+  NetworkStatusIndicator,
+} from './components/NetworkStatusIndicator';
+import { OfflineShellHeaderBanner } from './components/OfflineShellHeaderBanner';
 import { PhotoLightbox } from './components/PhotoLightbox';
 import { PhotoUploadDiagnosticOverlay } from './components/PhotoUploadDiagnosticOverlay';
 import { PhotoVaultView } from './components/PhotoVaultView';
 import { ReportPreview } from './components/ReportPreview';
-import { ReportsLibraryView } from './components/ReportsLibraryView';
+import {
+  type MergedReportSelectionItem,
+  ReportsLibraryView,
+} from './components/ReportsLibraryView';
+import { ShareReportModal } from './components/ShareReportModal';
 import { SignaturePad } from './components/SignaturePad';
+import {
+  type AppShellDetectionSnapshot,
+  checkForAppShellUpdates,
+  initializeAppShellDetection,
+  subscribeToAppShellStatus,
+} from './utils/appShellStatus';
 
-type ViewMode = 'reports' | 'form' | 'summary' | 'photos' | 'report';
+type ViewMode = 'dashboard' | 'reports' | 'form' | 'summary' | 'photos' | 'report';
 type FilterMode = 'all' | 'unanswered' | 'Yes' | 'No' | 'N/A' | 'photos';
 
 type LightboxState =
@@ -100,12 +177,57 @@ type LightboxState =
       record: StoredPhotoRecord;
     };
 
+function formatRelativeTime(
+  iso: string | null | undefined,
+  referenceMs: number
+): string {
+  const ts = iso ? Date.parse(iso) : NaN;
+  if (!Number.isFinite(ts)) return 'just now';
+  const diffSec = Math.max(0, Math.floor((referenceMs - ts) / 1000));
+  if (diffSec < 10) return 'just now';
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDays = Math.floor(diffHr / 24);
+  if (diffDays < 30) return `${diffDays}d ago`;
+  return new Date(ts).toLocaleDateString();
+}
+
 export default function App() {
   // Auth & Online Cloud state
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
   const [isSigningIn, setIsSigningIn] = useState(false);
+  const publicInspectorId = useMemo(() => getOrCreatePublicInspectorId(), []);
+  const effectiveUid = user?.uid || publicInspectorId;
   const [cloudReports, setCloudReports] = useState<CloudReportSummary[]>([]);
+  const [sharedReports, setSharedReports] = useState<CloudReportSummary[]>([]);
+  const [activeCollaboration, setActiveCollaboration] =
+    useState<ReportCollaborationInfo | null>(null);
+  const [shareModalReportId, setShareModalReportId] = useState<string | null>(
+    null
+  );
+  const [remoteUpdateNotice, setRemoteUpdateNotice] = useState<{
+    version: number;
+    editorName: string;
+  } | null>(null);
+  const [pendingShareLinkToken, setPendingShareLinkToken] = useState<
+    string | null
+  >(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.get('share');
+  });
+  const [pendingDirectReportId, setPendingDirectReportId] = useState<
+    string | null
+  >(() => {
+    if (typeof window === 'undefined') return null;
+    const params = new URLSearchParams(window.location.search);
+    return params.get('report');
+  });
+  const [isClaimingShareLink, setIsClaimingShareLink] = useState(false);
   const [loadingCloudReports, setLoadingCloudReports] = useState(false);
   const [cloudPhotos, setCloudPhotos] = useState<StoredPhotoRecord[]>([]);
   const [isSavingOnline, setIsSavingOnline] = useState(false);
@@ -117,12 +239,23 @@ export default function App() {
       return true;
     }
   });
+  const [hdUploadsEnabled, setHdUploadsEnabled] = useState<boolean>(() =>
+    getHdUploadsPreference()
+  );
   const [hasUnsavedCloudChanges, setHasUnsavedCloudChanges] = useState(false);
+  const [lastCloudSaveError, setLastCloudSaveError] =
+    useState<CloudSaveErrorInfo | null>(null);
   const [lastSyncedAt, setLastSyncedAt] = useState<string | null>(null);
   const [busyReportId, setBusyReportId] = useState<string | null>(null);
+  const [isExportingMergedPdf, setIsExportingMergedPdf] = useState(false);
+  const [mergedPdfProgress, setMergedPdfProgress] = useState<{
+    current: number;
+    total: number;
+  } | null>(null);
 
   // Active working report & local IndexedDB cache
   const [report, setReport] = useState<InspectionReport>(createBlankInspection);
+  const [customBranchForReportId, setCustomBranchForReportId] = useState<string | null>(null);
   const [localReports, setLocalReports] = useState<InspectionReport[]>([]);
   const [localPhotos, setLocalPhotos] = useState<StoredPhotoRecord[]>([]);
   const [isHydrated, setIsHydrated] = useState(false);
@@ -135,13 +268,29 @@ export default function App() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const [isExportingExcel, setIsExportingExcel] = useState(false);
+  const [isExportingDocx, setIsExportingDocx] = useState(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
+  const [isNetworkOffline, setIsNetworkOffline] = useState<boolean>(() =>
+    typeof navigator !== 'undefined' ? !navigator.onLine : false
+  );
+  const [appShellSnapshot, setAppShellSnapshot] =
+    useState<AppShellDetectionSnapshot>({
+      bootedFromOfflineCache:
+        typeof navigator !== 'undefined' ? !navigator.onLine : false,
+      cachedAt: null,
+      updateAvailable: false,
+    });
+  const [isCheckingAppUpdates, setIsCheckingAppUpdates] = useState(false);
+  const [shellUpdateNote, setShellUpdateNote] = useState<string | null>(null);
   const [storageWarning, setStorageWarning] = useState<string | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const [relativeNowMs, setRelativeNowMs] = useState<number>(() => Date.now());
 
   const [exportOptions, setExportOptions] = useState<PdfExportOptions>({
     includeSummary: true,
     includePhotoAppendix: true,
     includeInlineThumbnails: false,
+    includeConfidentialWatermark: true,
   });
 
   const [lightboxState, setLightboxState] = useState<LightboxState | null>(null);
@@ -155,14 +304,103 @@ export default function App() {
     PhotoUploadDiagnostic[]
   >([]);
   const [diagnosticsOverlayOpen, setDiagnosticsOverlayOpen] = useState(false);
+  const [backgroundSyncState, setBackgroundSyncState] =
+    useState<BackgroundSyncState>(INITIAL_BACKGROUND_SYNC_STATE);
   const saveTimerRef = useRef<number | null>(null);
   const cloudAutosaveTimerRef = useRef<number | null>(null);
+  const autosaveRetryTimerRef = useRef<number | null>(null);
   const autoSaveInFlightRef = useRef<boolean>(false);
+  const pendingAutosaveFollowUpRef = useRef<boolean>(false);
   const editVersionRef = useRef<number>(0);
+  const dirtyFieldsRef = useRef<{
+    full: boolean;
+    meta: boolean;
+    items: Set<number>;
+    signOffKeys: Set<SignOffRoleKey>;
+    photoIds: Set<string>;
+  }>({
+    full: false,
+    meta: false,
+    items: new Set(),
+    signOffKeys: new Set(),
+    photoIds: new Set(),
+  });
   const captionTimersRef = useRef<Map<string, number>>(new Map());
   const uploadRunTokensRef = useRef<Map<string, number>>(new Map());
+  const backgroundSyncServiceRef = useRef<PhotoBackgroundSyncService | null>(
+    null
+  );
+  const fetchedPhotoCountsRef = useRef<Map<string, number>>(new Map());
+  const userRef = useRef<User | null>(user);
+  userRef.current = user;
+  const effectiveUidRef = useRef<string>(effectiveUid);
+  effectiveUidRef.current = effectiveUid;
   const reportRef = useRef<InspectionReport>(report);
   reportRef.current = report;
+  const localReportsRef = useRef<InspectionReport[]>(localReports);
+  localReportsRef.current = localReports;
+  const sharedReportsRef = useRef<CloudReportSummary[]>(sharedReports);
+  sharedReportsRef.current = sharedReports;
+  const autoSaveEnabledRef = useRef<boolean>(autoSaveEnabled);
+  autoSaveEnabledRef.current = autoSaveEnabled;
+  const activeCollaborationRef = useRef<ReportCollaborationInfo | null>(
+    activeCollaboration
+  );
+  activeCollaborationRef.current = activeCollaboration;
+  const hasUnsavedCloudChangesRef = useRef<boolean>(hasUnsavedCloudChanges);
+  hasUnsavedCloudChangesRef.current = hasUnsavedCloudChanges;
+  const lastSyncedAtRef = useRef<string | null>(lastSyncedAt);
+  lastSyncedAtRef.current = lastSyncedAt;
+
+  const isReadOnlyViewer = activeCollaboration?.accessRole === 'viewer';
+
+  const persistActiveSyncState = useCallback(
+    (overrides?: {
+      reportId?: string;
+      hasUnsavedCloudChanges?: boolean;
+      lastSyncedAt?: string | null;
+    }) => {
+      const targetReportId = overrides?.reportId ?? reportRef.current.id;
+      const unsaved =
+        overrides?.hasUnsavedCloudChanges ?? hasUnsavedCloudChangesRef.current;
+      const syncedAt =
+        overrides?.lastSyncedAt !== undefined
+          ? overrides.lastSyncedAt
+          : lastSyncedAtRef.current;
+      void saveDraftSyncStateToDb({
+        reportId: targetReportId,
+        hasUnsavedCloudChanges: unsaved,
+        lastSyncedAt: syncedAt,
+        dirtyFull: dirtyFieldsRef.current.full,
+        dirtyMeta: dirtyFieldsRef.current.meta,
+        dirtyItemNumbers: Array.from(dirtyFieldsRef.current.items),
+        dirtySignOffKeys: Array.from(dirtyFieldsRef.current.signOffKeys),
+        dirtyPhotoIds: Array.from(dirtyFieldsRef.current.photoIds),
+        updatedAt: new Date().toISOString(),
+      });
+    },
+    []
+  );
+
+  const resetDirtyTracker = () => {
+    dirtyFieldsRef.current = {
+      full: false,
+      meta: false,
+      items: new Set(),
+      signOffKeys: new Set(),
+      photoIds: new Set(),
+    };
+  };
+
+  const clearUrlShareParams = () => {
+    if (typeof window === 'undefined') return;
+    const url = new URL(window.location.href);
+    if (url.searchParams.has('share') || url.searchParams.has('report')) {
+      url.searchParams.delete('share');
+      url.searchParams.delete('report');
+      window.history.replaceState({}, '', url.toString());
+    }
+  };
 
   const showToast = (msg: string) => {
     setToastMessage(msg);
@@ -170,6 +408,74 @@ export default function App() {
       setToastMessage((prev) => (prev === msg ? null : prev));
     }, 3200);
   };
+
+  // Refresh relative "Last modified" display every 15s and immediately when timestamps change
+  useEffect(() => {
+    setRelativeNowMs(Date.now());
+    const id = window.setInterval(() => {
+      setRelativeNowMs(Date.now());
+    }, 15000);
+    return () => window.clearInterval(id);
+  }, [report.updatedAt, lastSyncedAt]);
+
+  // Track global browser offline/online state (covers auth gate as well as main app)
+  useEffect(() => {
+    const handleWindowOffline = () => {
+      setIsNetworkOffline(true);
+    };
+    const handleWindowOnline = () => {
+      // When signed in, NetworkStatusIndicator verifies real reachability before clearing;
+      // on the auth gate, clear immediately on browser online.
+      if (!userRef.current) {
+        setIsNetworkOffline(false);
+      }
+    };
+    window.addEventListener('offline', handleWindowOffline);
+    window.addEventListener('online', handleWindowOnline);
+    return () => {
+      window.removeEventListener('offline', handleWindowOffline);
+      window.removeEventListener('online', handleWindowOnline);
+    };
+  }, []);
+
+  // Detect whether the current page booted from an offline cached app shell
+  useEffect(() => {
+    const unsubscribe = subscribeToAppShellStatus((snapshot) => {
+      setAppShellSnapshot(snapshot);
+    });
+    void initializeAppShellDetection();
+    return unsubscribe;
+  }, []);
+
+  const handleCheckForAppUpdates = useCallback(async () => {
+    setIsCheckingAppUpdates(true);
+    setShellUpdateNote('Fetching latest app shell…');
+    try {
+      const result = await checkForAppShellUpdates();
+      if (result.status === 'offline') {
+        setIsNetworkOffline(true);
+        setShellUpdateNote(result.message);
+        showToast(result.message);
+      } else if (result.shouldReload) {
+        setShellUpdateNote(result.message);
+        showToast(result.message);
+        window.setTimeout(() => {
+          window.location.reload();
+        }, 450);
+      } else {
+        setIsNetworkOffline(false);
+        setShellUpdateNote(null);
+        showToast(result.message);
+      }
+    } finally {
+      setIsCheckingAppUpdates(false);
+    }
+  }, []);
+
+  const isRunningFromOfflineCache =
+    appShellSnapshot.bootedFromOfflineCache ||
+    appShellSnapshot.updateAvailable ||
+    isNetworkOffline;
 
   // Track Firebase auth state
   useEffect(() => {
@@ -180,52 +486,290 @@ export default function App() {
     return () => unsubscribe();
   }, []);
 
-  // Subscribe to online Firestore reports when signed in
+  // Subscribe to online Firestore reports (public & signed-in) once auth initializes
   useEffect(() => {
-    if (!authReady || !user) {
+    if (!authReady) {
       setCloudReports([]);
+      setSharedReports([]);
       setCloudPhotos([]);
+      fetchedPhotoCountsRef.current.clear();
+      setActiveCollaboration(null);
+      setRemoteUpdateNotice(null);
+      setLastCloudSaveError(null);
       setLoadingCloudReports(false);
       return;
     }
 
     setLoadingCloudReports(true);
-    const unsubscribe = subscribeToUserReports(
-      user.uid,
+    const unsubOwned = subscribeToUserReports(
+      effectiveUid,
+      user?.email,
       (list) => {
         setCloudReports(list);
         setLoadingCloudReports(false);
       },
       (err) => {
         setLoadingCloudReports(false);
-        setStorageWarning(
-          `Online sync notice: ${err.message.slice(0, 140)}`
-        );
+        const msg = err.message || '';
+        if (
+          msg.toLowerCase().includes('quota') ||
+          msg.toLowerCase().includes('resource-exhausted')
+        ) {
+          return;
+        }
+        console.warn('[CloudReports] Online sync notice:', msg);
+      }
+    );
+
+    const unsubShared = user?.email
+      ? subscribeToSharedReports(
+          effectiveUid,
+          user.email,
+          (list) => {
+            setSharedReports(list);
+          },
+          (err) => {
+            console.warn('[SharedReports] Listener warning:', err.message);
+          }
+        )
+      : () => {
+          setSharedReports([]);
+        };
+
+    return () => {
+      unsubOwned();
+      unsubShared();
+    };
+  }, [authReady, effectiveUid, user?.email]);
+
+  // Handle incoming ?share=<token> or ?report=<id> links
+  useEffect(() => {
+    if (!authReady) return;
+    if (!pendingShareLinkToken && !pendingDirectReportId) return;
+
+    let cancelled = false;
+
+    const processIncomingLink = async () => {
+      if (pendingShareLinkToken) {
+        if (!user) return;
+        if (!user.email) {
+          showToast('Verified Google email required to open share links');
+          setPendingShareLinkToken(null);
+          clearUrlShareParams();
+          return;
+        }
+        setIsClaimingShareLink(true);
+        try {
+          const claimed = await claimShareLinkOnline(
+            user.uid,
+            user.email,
+            pendingShareLinkToken
+          );
+          if (cancelled) return;
+          const loaded = await loadReportWithPhotosOnline(
+            user.uid,
+            claimed.reportId,
+            user.email
+          );
+          if (cancelled) return;
+          if (loaded) {
+            setReport(loaded.report);
+            setActiveCollaboration(loaded.collaboration);
+            setHasUnsavedCloudChanges(false);
+            setLastSyncedAt(loaded.report.updatedAt || new Date().toISOString());
+            setRemoteUpdateNotice(null);
+            resetDirtyTracker();
+            setViewMode('form');
+            showToast(
+              loaded.collaboration.accessRole === 'owner'
+                ? 'Opened your report from share link'
+                : `Opened shared report (${loaded.collaboration.accessRole === 'editor' ? 'Can Edit' : 'View Only'})`
+            );
+          } else {
+            showToast('Shared report could not be found');
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setStorageWarning(
+            msg.includes('invalid or has been revoked')
+              ? msg
+              : 'Could not open shared link. It may have been revoked by the report owner.'
+          );
+        } finally {
+          if (!cancelled) {
+            setIsClaimingShareLink(false);
+            setPendingShareLinkToken(null);
+            clearUrlShareParams();
+          }
+        }
+        return;
+      }
+
+      if (pendingDirectReportId) {
+        setIsClaimingShareLink(true);
+        try {
+          const loaded = await loadReportWithPhotosOnline(
+            effectiveUid,
+            pendingDirectReportId,
+            user?.email
+          );
+          if (cancelled) return;
+          if (loaded) {
+            setReport(loaded.report);
+            setActiveCollaboration(loaded.collaboration);
+            setHasUnsavedCloudChanges(false);
+            setLastSyncedAt(loaded.report.updatedAt || new Date().toISOString());
+            setRemoteUpdateNotice(null);
+            resetDirtyTracker();
+            setViewMode('form');
+            showToast('Opened shared report');
+          } else {
+            showToast('Report not found or access not granted');
+          }
+        } catch {
+          setStorageWarning(
+            'Could not load the requested report.'
+          );
+        } finally {
+          if (!cancelled) {
+            setIsClaimingShareLink(false);
+            setPendingDirectReportId(null);
+            clearUrlShareParams();
+          }
+        }
+      }
+    };
+
+    void processIncomingLink();
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, user, effectiveUid, pendingShareLinkToken, pendingDirectReportId]);
+
+  // Live real-time listener on the currently open online report (multi-device & collaborator sync)
+  const isCurrentReportOnline = useMemo(
+    () =>
+      cloudReports.some((r) => r.id === report.id) ||
+      sharedReports.some((r) => r.id === report.id),
+    [cloudReports, sharedReports, report.id]
+  );
+
+  useEffect(() => {
+    if (!authReady || !isCurrentReportOnline) return;
+
+    const unsubscribe = subscribeToActiveReport(
+      report.id,
+      effectiveUid,
+      user?.email,
+      ({ collaboration, hasPendingWrites }) => {
+        const prevCollab = activeCollaborationRef.current;
+        setActiveCollaboration(collaboration);
+
+        if (hasPendingWrites) return;
+        if (
+          prevCollab &&
+          collaboration.syncVersion > prevCollab.syncVersion &&
+          collaboration.lastEditedByUid !== effectiveUid
+        ) {
+          const editorLabel =
+            collaboration.lastEditedByName || collaboration.ownerName || 'Collaborator';
+          if (hasUnsavedCloudChangesRef.current) {
+            setRemoteUpdateNotice({
+              version: collaboration.syncVersion,
+              editorName: editorLabel,
+            });
+          } else {
+            void loadReportWithPhotosOnline(effectiveUid, report.id, user?.email)
+              .then((fresh) => {
+                if (!fresh || reportRef.current.id !== report.id) return;
+                if (hasUnsavedCloudChangesRef.current) return;
+                setReport(fresh.report);
+                setActiveCollaboration(fresh.collaboration);
+                setLastSyncedAt(fresh.report.updatedAt || new Date().toISOString());
+                setRemoteUpdateNotice(null);
+                resetDirtyTracker();
+                showToast(`Synced live update from ${editorLabel}`);
+              })
+              .catch(() => {
+                // ignore transient fetch errors
+              });
+          }
+        }
       }
     );
 
     return () => unsubscribe();
-  }, [authReady, user]);
+  }, [authReady, effectiveUid, user?.email, report.id, isCurrentReportOnline]);
 
-  // Refresh online Photo Vault whenever cloud reports list changes
+  // Incrementally refresh online Photo Vault ONLY for reports whose photoCount actually changed
   useEffect(() => {
-    if (!user || cloudReports.length === 0) {
+    if (!authReady || cloudReports.length === 0) {
+      fetchedPhotoCountsRef.current.clear();
       setCloudPhotos([]);
       return;
     }
+
+    const activeIdsWithPhotos = new Set<string>();
+    const idsNeedingFetch: string[] = [];
+
+    for (const r of cloudReports) {
+      if (r.stats.photoCount > 0) {
+        activeIdsWithPhotos.add(r.id);
+        if (fetchedPhotoCountsRef.current.get(r.id) !== r.stats.photoCount) {
+          idsNeedingFetch.push(r.id);
+        }
+      } else {
+        fetchedPhotoCountsRef.current.delete(r.id);
+      }
+    }
+
+    for (const cachedId of Array.from(fetchedPhotoCountsRef.current.keys())) {
+      if (!activeIdsWithPhotos.has(cachedId)) {
+        fetchedPhotoCountsRef.current.delete(cachedId);
+      }
+    }
+
+    if (activeIdsWithPhotos.size === 0) {
+      setCloudPhotos([]);
+      return;
+    }
+
+    // Prune photos from removed reports immediately
+    setCloudPhotos((prev) => {
+      const next = prev.filter((p) => activeIdsWithPhotos.has(p.reportId));
+      return next.length === prev.length ? prev : next;
+    });
+
+    if (idsNeedingFetch.length === 0) {
+      return;
+    }
+
     let cancelled = false;
-    const idsWithPhotos = cloudReports
-      .filter((r) => r.stats.photoCount > 0)
-      .map((r) => r.id);
-
-    if (idsWithPhotos.length === 0) {
-      setCloudPhotos([]);
-      return;
+    const expectedCounts = new Map<string, number>();
+    for (const id of idsNeedingFetch) {
+      const match = cloudReports.find((r) => r.id === id);
+      if (match) expectedCounts.set(id, match.stats.photoCount);
     }
 
-    loadAllUserPhotosOnline(user.uid, idsWithPhotos)
+    loadAllUserPhotosOnline(effectiveUid, idsNeedingFetch)
       .then((records) => {
-        if (!cancelled) setCloudPhotos(records);
+        if (cancelled) return;
+        for (const [id, count] of expectedCounts.entries()) {
+          fetchedPhotoCountsRef.current.set(id, count);
+        }
+        const fetchedReportIdSet = new Set(idsNeedingFetch);
+        setCloudPhotos((prev) => {
+          const kept = prev.filter(
+            (p) =>
+              activeIdsWithPhotos.has(p.reportId) &&
+              !fetchedReportIdSet.has(p.reportId)
+          );
+          const merged = [...records, ...kept];
+          merged.sort((a, b) =>
+            (b.capturedAt || '').localeCompare(a.capturedAt || '')
+          );
+          return merged;
+        });
       })
       .catch(() => {
         // Error already logged by handleFirestoreError
@@ -234,21 +778,43 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [user, cloudReports]);
+  }, [authReady, effectiveUid, cloudReports]);
 
-  // Hydrate active draft & local IndexedDB snapshots on startup
+  // Hydrate active draft, saved snapshots, photo vault & durable sync state on startup
   useEffect(() => {
     let cancelled = false;
     async function hydrate() {
-      const [draft, history, photos] = await Promise.all([
+      const [draft, history, photos, syncState] = await Promise.all([
         loadActiveDraftFromDb(),
         loadSavedReportsFromDb(),
         loadAllStoredPhotosFromDb(),
+        loadDraftSyncStateFromDb(),
       ]);
       if (cancelled) return;
       setReport(draft);
       setLocalReports(history);
       setLocalPhotos(photos);
+
+      if (syncState && syncState.reportId === draft.id) {
+        if (syncState.lastSyncedAt) {
+          setLastSyncedAt(syncState.lastSyncedAt);
+        }
+        if (syncState.hasUnsavedCloudChanges) {
+          setHasUnsavedCloudChanges(true);
+          dirtyFieldsRef.current = {
+            full:
+              syncState.dirtyFull ||
+              (!syncState.dirtyMeta &&
+                syncState.dirtyItemNumbers.length === 0 &&
+                syncState.dirtySignOffKeys.length === 0 &&
+                syncState.dirtyPhotoIds.length === 0),
+            meta: syncState.dirtyMeta,
+            items: new Set(syncState.dirtyItemNumbers),
+            signOffKeys: new Set(syncState.dirtySignOffKeys),
+            photoIds: new Set(syncState.dirtyPhotoIds),
+          };
+        }
+      }
       setIsHydrated(true);
     }
     hydrate();
@@ -257,6 +823,34 @@ export default function App() {
     };
   }, []);
 
+  const flushLocalDraftNow = useCallback(async (targetReport: InspectionReport) => {
+    try {
+      const hasExistingSnapshot = localReportsRef.current.some(
+        (r) => r.id === targetReport.id
+      );
+      await saveActiveDraftToDb(targetReport);
+      if (hasExistingSnapshot) {
+        await saveReportSnapshotToDb(targetReport);
+        setLocalReports((prev) => {
+          const idx = prev.findIndex((r) => r.id === targetReport.id);
+          if (idx === -1) return prev;
+          const next = [...prev];
+          next[idx] = targetReport;
+          return next;
+        });
+      }
+      persistActiveSyncState({ reportId: targetReport.id });
+      const allPhotos = await loadAllStoredPhotosFromDb();
+      setLocalPhotos(allPhotos);
+    } catch (err) {
+      if (isLocalStorageQuotaError(err)) {
+        setStorageWarning(
+          'Device storage is full — delete old snapshots or export backups to avoid losing edits.'
+        );
+      }
+    }
+  }, [persistActiveSyncState]);
+
   // Auto-save active draft to IndexedDB for instant offline safety
   useEffect(() => {
     if (!isHydrated) return;
@@ -264,14 +858,8 @@ export default function App() {
       window.clearTimeout(saveTimerRef.current);
     }
     saveTimerRef.current = window.setTimeout(() => {
-      saveActiveDraftToDb(report)
-        .then(() => loadAllStoredPhotosFromDb())
-        .then((allPhotos) => {
-          setLocalPhotos(allPhotos);
-        })
-        .catch(() => {
-          // Ignore silent local backup failure
-        });
+      saveTimerRef.current = null;
+      void flushLocalDraftNow(report);
     }, 240);
 
     return () => {
@@ -279,7 +867,24 @@ export default function App() {
         window.clearTimeout(saveTimerRef.current);
       }
     };
-  }, [report, isHydrated]);
+  }, [report, isHydrated, flushLocalDraftNow]);
+
+  // Keep durable sync metadata aligned whenever report identity, unsaved status, or sync timestamp changes
+  useEffect(() => {
+    if (!isHydrated) return;
+    persistActiveSyncState({
+      reportId: report.id,
+      hasUnsavedCloudChanges,
+      lastSyncedAt,
+    });
+  }, [
+    isHydrated,
+    report.id,
+    report.updatedAt,
+    hasUnsavedCloudChanges,
+    lastSyncedAt,
+    persistActiveSyncState,
+  ]);
 
   const handleToggleAutoSave = (enabled: boolean) => {
     setAutoSaveEnabled(enabled);
@@ -288,49 +893,176 @@ export default function App() {
     } catch {
       // ignore storage errors
     }
+    if (!enabled && autosaveRetryTimerRef.current) {
+      window.clearTimeout(autosaveRetryTimerRef.current);
+      autosaveRetryTimerRef.current = null;
+    }
     showToast(enabled ? 'Auto-save enabled' : 'Auto-save paused');
   };
 
-  const runCloudAutosave = async (targetUser: User) => {
+  const handleToggleHdUploads = (enabled: boolean) => {
+    setHdUploadsEnabled(enabled);
+    setHdUploadsPreference(enabled);
+    showToast(
+      enabled
+        ? 'HD photo uploads enabled (up to 1920px)'
+        : 'Standard photo uploads enabled (up to 1280px)'
+    );
+  };
+
+  const runCloudAutosave = async (targetUser?: User | null) => {
     if (
-      autoSaveInFlightRef.current ||
       isSavingOnline ||
+      activeCollaborationRef.current?.accessRole === 'viewer' ||
       (typeof navigator !== 'undefined' && !navigator.onLine)
     ) {
       return;
     }
 
+    if (autoSaveInFlightRef.current) {
+      pendingAutosaveFollowUpRef.current = true;
+      return;
+    }
+
+    if (autosaveRetryTimerRef.current) {
+      window.clearTimeout(autosaveRetryTimerRef.current);
+      autosaveRetryTimerRef.current = null;
+    }
+
+    const activeUser = targetUser !== undefined ? targetUser : userRef.current;
+    const activeUid = activeUser?.uid || effectiveUidRef.current;
     const saveVersion = editVersionRef.current;
     const snapshot: InspectionReport = {
       ...reportRef.current,
       updatedAt: new Date().toISOString(),
+    };
+    const collab = activeCollaborationRef.current;
+    const isOwner = !collab || collab.ownerId === activeUid;
+    const nextSyncVersion = (collab?.syncVersion ?? 0) + 1;
+    const actorName =
+      activeUser?.displayName ||
+      activeUser?.email ||
+      snapshot.meta.inspectedBy ||
+      'Inspector';
+
+    const dirtySnap: ReportDirtyDelta = {
+      full:
+        dirtyFieldsRef.current.full ||
+        (!dirtyFieldsRef.current.meta &&
+          dirtyFieldsRef.current.items.size === 0 &&
+          dirtyFieldsRef.current.signOffKeys.size === 0 &&
+          dirtyFieldsRef.current.photoIds.size === 0),
+      meta: dirtyFieldsRef.current.meta,
+      itemNumbers: Array.from(dirtyFieldsRef.current.items),
+      signOffKeys: Array.from(dirtyFieldsRef.current.signOffKeys),
+      photoIds: Array.from(dirtyFieldsRef.current.photoIds),
     };
 
     autoSaveInFlightRef.current = true;
     setIsAutoSaving(true);
 
     try {
-      await autosaveReportDocumentOnline(targetUser.uid, snapshot);
-      void saveReportSnapshotToDb(snapshot)
+      const saved = await autosaveReportDocumentOnline(
+        activeUid,
+        snapshot,
+        {
+          actorName,
+          isOwner,
+          nextSyncVersion,
+          dirty: dirtySnap,
+        }
+      );
+
+      const didForkId = saved.reportId !== snapshot.id;
+      const persistedSnapshot: InspectionReport = didForkId
+        ? { ...snapshot, id: saved.reportId }
+        : snapshot;
+
+      if (didForkId && reportRef.current.id === snapshot.id) {
+        const migratedReport: InspectionReport = {
+          ...reportRef.current,
+          id: saved.reportId,
+        };
+        reportRef.current = migratedReport;
+        setReport(migratedReport);
+        void saveActiveDraftToDb(migratedReport).catch(() => undefined);
+        void deleteSavedReportFromDb(snapshot.id).catch(() => undefined);
+      }
+
+      void saveReportSnapshotToDb(persistedSnapshot)
         .then(() =>
           setLocalReports((prev) => {
-            const filtered = prev.filter((r) => r.id !== snapshot.id);
-            return [snapshot, ...filtered];
+            const filtered = prev.filter(
+              (r) => r.id !== snapshot.id && r.id !== persistedSnapshot.id
+            );
+            return [persistedSnapshot, ...filtered];
           })
         )
-        .catch(() => {
-          // Ignore silent local history backup failure
+        .catch((err) => {
+          if (isLocalStorageQuotaError(err)) {
+            setStorageWarning(
+              'Device storage is nearly full — cloud copy succeeded, consider clearing old local snapshots.'
+            );
+          }
         });
 
-      setLastSyncedAt(new Date().toISOString());
+      const syncedIso = new Date().toISOString();
+      setLastSyncedAt(syncedIso);
+      setLastCloudSaveError(null);
+      setActiveCollaboration((prev) =>
+        prev
+          ? {
+              ...prev,
+              syncVersion: saved.syncVersion,
+              lastEditedByUid: activeUid,
+              lastEditedByName: actorName,
+            }
+          : prev
+      );
       if (editVersionRef.current === saveVersion) {
         setHasUnsavedCloudChanges(false);
+        resetDirtyTracker();
+        persistActiveSyncState({
+          reportId: persistedSnapshot.id,
+          hasUnsavedCloudChanges: false,
+          lastSyncedAt: syncedIso,
+        });
+      } else {
+        pendingAutosaveFollowUpRef.current = true;
+        persistActiveSyncState({
+          reportId: persistedSnapshot.id,
+          lastSyncedAt: syncedIso,
+        });
+      }
+
+      // If any local/failed photos remain on this report or saved local reports while online, kick off background sync
+      const hasPendingPhotos =
+        Object.values(persistedSnapshot.responses).some((r) =>
+          r.photos.some(
+            (ph) => ph.uploadState === 'local' || ph.uploadState === 'error'
+          )
+        ) ||
+        localReportsRef.current.some((rep) =>
+          Object.values(rep.responses).some((r) =>
+            r.photos.some(
+              (ph) => ph.uploadState === 'local' || ph.uploadState === 'error'
+            )
+          )
+        );
+      if (hasPendingPhotos) {
+        void backgroundSyncServiceRef.current?.triggerSync('scheduled');
       }
     } catch (err) {
       const details = extractFirebaseErrorDetails(err);
       console.warn('[AutoSave] Deferred cloud autosave:', {
         code: details.code,
         message: details.rawMessage,
+      });
+      setLastCloudSaveError({
+        code: details.code,
+        summary: details.friendlySummary,
+        detail: details.rawMessage,
+        at: new Date().toISOString(),
       });
       if (
         details.code === 'resource-exhausted' ||
@@ -339,22 +1071,67 @@ export default function App() {
         setStorageWarning(
           'Daily Firestore quota reached — auto-save paused online while edits stay saved locally.'
         );
+      } else if (
+        autoSaveEnabledRef.current &&
+        hasUnsavedCloudChangesRef.current &&
+        (typeof navigator === 'undefined' || navigator.onLine) &&
+        !autosaveRetryTimerRef.current
+      ) {
+        // Schedule automatic retry after transient network/Firestore errors
+        autosaveRetryTimerRef.current = window.setTimeout(() => {
+          autosaveRetryTimerRef.current = null;
+          if (
+            autoSaveEnabledRef.current &&
+            hasUnsavedCloudChangesRef.current &&
+            (typeof navigator === 'undefined' || navigator.onLine)
+          ) {
+            void runCloudAutosave(userRef.current);
+          }
+        }, 12_000);
       }
     } finally {
       autoSaveInFlightRef.current = false;
       setIsAutoSaving(false);
+
+      if (pendingAutosaveFollowUpRef.current) {
+        pendingAutosaveFollowUpRef.current = false;
+        if (
+          autoSaveEnabledRef.current &&
+          hasUnsavedCloudChangesRef.current &&
+          (typeof navigator === 'undefined' || navigator.onLine)
+        ) {
+          window.setTimeout(() => {
+            if (
+              autoSaveEnabledRef.current &&
+              hasUnsavedCloudChangesRef.current
+            ) {
+              void runCloudAutosave(userRef.current);
+            }
+          }, 500);
+        }
+      }
     }
   };
 
-  // Debounced online Firestore autosave whenever signed-in user edits the report
+  // Clear pending autosave retry timer on unmount
+  useEffect(() => {
+    return () => {
+      if (autosaveRetryTimerRef.current) {
+        window.clearTimeout(autosaveRetryTimerRef.current);
+        autosaveRetryTimerRef.current = null;
+      }
+    };
+  }, []);
+
+  // Debounced online Firestore autosave whenever user edits the report
   useEffect(() => {
     if (
       !isHydrated ||
       !authReady ||
-      !user ||
       !autoSaveEnabled ||
       !hasUnsavedCloudChanges ||
-      isSavingOnline
+      isSavingOnline ||
+      isReadOnlyViewer
     ) {
       return;
     }
@@ -366,7 +1143,7 @@ export default function App() {
     cloudAutosaveTimerRef.current = window.setTimeout(() => {
       cloudAutosaveTimerRef.current = null;
       void runCloudAutosave(user);
-    }, 2000);
+    }, 1200);
 
     return () => {
       if (cloudAutosaveTimerRef.current) {
@@ -381,29 +1158,81 @@ export default function App() {
     isHydrated,
     authReady,
     user,
+    effectiveUid,
     isSavingOnline,
+    isReadOnlyViewer,
   ]);
 
-  // Flush pending online autosave immediately if user switches tabs or minimizes
+  // Flush pending local IndexedDB draft & pending cloud autosave on tab hide / pagehide / reconnect
   useEffect(() => {
-    if (!user || !autoSaveEnabled) return;
-    const handleVisibilityChange = () => {
+    if (!isHydrated) return;
+
+    const flushAllPendingSaves = () => {
+      if (saveTimerRef.current) {
+        window.clearTimeout(saveTimerRef.current);
+        saveTimerRef.current = null;
+        void flushLocalDraftNow(reportRef.current);
+      }
       if (
-        document.visibilityState === 'hidden' &&
-        hasUnsavedCloudChanges &&
-        !isSavingOnline
+        autoSaveEnabled &&
+        hasUnsavedCloudChangesRef.current &&
+        !isSavingOnline &&
+        activeCollaborationRef.current?.accessRole !== 'viewer'
       ) {
         if (cloudAutosaveTimerRef.current) {
           window.clearTimeout(cloudAutosaveTimerRef.current);
           cloudAutosaveTimerRef.current = null;
         }
-        void runCloudAutosave(user);
+        void runCloudAutosave(userRef.current);
       }
     };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'hidden') {
+        flushAllPendingSaves();
+      }
+    };
+
+    const handlePageHide = () => {
+      flushAllPendingSaves();
+    };
+
+    const handleWindowOnlineFlush = () => {
+      if (
+        autoSaveEnabled &&
+        hasUnsavedCloudChangesRef.current &&
+        !isSavingOnline
+      ) {
+        window.setTimeout(() => {
+          if (hasUnsavedCloudChangesRef.current) {
+            void runCloudAutosave(userRef.current);
+          }
+        }, 700);
+      }
+    };
+
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      const hasUploadingPhotos = Object.values(reportRef.current.responses).some(
+        (r) => r.photos.some((p) => p.uploadState === 'uploading')
+      );
+      if (hasUploadingPhotos || isSavingOnline || autoSaveInFlightRef.current) {
+        flushAllPendingSaves();
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    };
+
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    return () =>
+    window.addEventListener('pagehide', handlePageHide);
+    window.addEventListener('online', handleWindowOnlineFlush);
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-  }, [user, autoSaveEnabled, hasUnsavedCloudChanges, isSavingOnline]);
+      window.removeEventListener('pagehide', handlePageHide);
+      window.removeEventListener('online', handleWindowOnlineFlush);
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, [isHydrated, autoSaveEnabled, isSavingOnline, flushLocalDraftNow]);
 
   // Combine online cloud photos and local photos (cloud takes priority on matching IDs)
   const combinedStoredPhotos = useMemo(() => {
@@ -493,6 +1322,23 @@ export default function App() {
     return { uploading, failed, localOnly };
   }, [indexedPhotos]);
 
+  const otherReportsPendingPhotoCount = useMemo(() => {
+    let count = 0;
+    for (const rep of localReports) {
+      if (rep.id === report.id) continue;
+      const sharedSummary = sharedReports.find((r) => r.id === rep.id);
+      if (sharedSummary && sharedSummary.accessRole === 'viewer') continue;
+      for (const resp of Object.values(rep.responses)) {
+        for (const ph of resp.photos) {
+          if (ph.uploadState === 'local' || ph.uploadState === 'error') {
+            count++;
+          }
+        }
+      }
+    }
+    return count;
+  }, [localReports, report.id, sharedReports]);
+
   const totalUniqueStoredPhotos = useMemo(() => {
     const ids = new Set<string>(combinedStoredPhotos.map((p) => p.id));
     for (const p of indexedPhotos) {
@@ -502,33 +1348,210 @@ export default function App() {
   }, [combinedStoredPhotos, indexedPhotos]);
 
   const mutateReport = (
-    updater: (prev: InspectionReport) => InspectionReport
+    updater: (prev: InspectionReport) => InspectionReport,
+    dirty?: {
+      full?: boolean;
+      meta?: boolean;
+      itemNumber?: number;
+      signOffKey?: SignOffRoleKey;
+      photoId?: string;
+    }
   ) => {
+    if (activeCollaborationRef.current?.accessRole === 'viewer') {
+      showToast('View-only shared report — click Duplicate to make your own editable copy');
+      return;
+    }
+    if (!dirty || dirty.full) {
+      dirtyFieldsRef.current.full = true;
+    } else {
+      if (dirty.meta) dirtyFieldsRef.current.meta = true;
+      if (typeof dirty.itemNumber === 'number') {
+        dirtyFieldsRef.current.items.add(dirty.itemNumber);
+      }
+      if (dirty.signOffKey) {
+        dirtyFieldsRef.current.signOffKeys.add(dirty.signOffKey);
+      }
+      if (dirty.photoId) {
+        dirtyFieldsRef.current.photoIds.add(dirty.photoId);
+      }
+    }
     editVersionRef.current += 1;
     setReport((prev) => updater(prev));
     setHasUnsavedCloudChanges(true);
   };
 
+  // Combined index of all known reports (cloud + shared + local) for automatic per-branch numbering
+  const allKnownReportRecords = useMemo<ReportSequenceRecord[]>(
+    () => [
+      ...cloudReports.map((r) => ({
+        id: r.id,
+        storeLocation: r.storeLocation,
+        dateOfInspection: r.dateOfInspection,
+        reportSequence: r.reportSequence,
+        createdAt: r.createdAtIso,
+        updatedAt: r.updatedAtIso,
+      })),
+      ...sharedReports.map((r) => ({
+        id: r.id,
+        storeLocation: r.storeLocation,
+        dateOfInspection: r.dateOfInspection,
+        reportSequence: r.reportSequence,
+        createdAt: r.createdAtIso,
+        updatedAt: r.updatedAtIso,
+      })),
+      ...localReports.map((r) => ({
+        id: r.id,
+        storeLocation: r.meta.storeLocation,
+        dateOfInspection: r.meta.dateOfInspection,
+        reportSequence: r.meta.reportSequence,
+        updatedAt: r.updatedAt,
+      })),
+    ],
+    [cloudReports, sharedReports, localReports]
+  );
+
+  const resolvedSequenceMap = useMemo(
+    () => resolveReportSequenceMap(allKnownReportRecords),
+    [allKnownReportRecords]
+  );
+
+  const withResolvedSequence = useCallback(
+    (entry: InspectionReport): InspectionReport => {
+      if (
+        typeof entry.meta.reportSequence === 'number' &&
+        Number.isFinite(entry.meta.reportSequence) &&
+        entry.meta.reportSequence >= 1
+      ) {
+        return entry;
+      }
+      const resolved =
+        resolvedSequenceMap.get(entry.id) ??
+        computeNextBranchReportSequence(
+          entry.meta.storeLocation,
+          entry.meta.dateOfInspection,
+          allKnownReportRecords,
+          entry.id
+        );
+      return {
+        ...entry,
+        meta: {
+          ...entry.meta,
+          reportSequence: resolved,
+        },
+      };
+    },
+    [resolvedSequenceMap, allKnownReportRecords]
+  );
+
   const updateMeta = <K extends keyof InspectionReport['meta']>(
     key: K,
     value: InspectionReport['meta'][K]
   ) => {
-    mutateReport((prev) => ({
-      ...prev,
-      updatedAt: new Date().toISOString(),
-      meta: { ...prev.meta, [key]: value },
-    }));
+    mutateReport(
+      (prev) => {
+        const nextMeta: InspectionReport['meta'] = { ...prev.meta, [key]: value };
+        if (
+          key === 'dateOfInspection' &&
+          typeof value === 'string' &&
+          prev.meta.storeLocation.trim() &&
+          getInspectionShortYear(value) !==
+            getInspectionShortYear(prev.meta.dateOfInspection)
+        ) {
+          nextMeta.reportSequence = computeNextBranchReportSequence(
+            prev.meta.storeLocation,
+            value,
+            allKnownReportRecords,
+            prev.id
+          );
+        }
+        return {
+          ...prev,
+          updatedAt: new Date().toISOString(),
+          meta: nextMeta,
+        };
+      },
+      { meta: true }
+    );
+  };
+
+  const handleSelectBranch = (selectedValue: string) => {
+    if (selectedValue === CUSTOM_BRANCH_OPTION) {
+      setCustomBranchForReportId(report.id);
+      if (isPresetBranch(report.meta.storeLocation)) {
+        mutateReport(
+          (prev) => ({
+            ...prev,
+            updatedAt: new Date().toISOString(),
+            meta: {
+              ...prev.meta,
+              storeLocation: '',
+              reportSequence: 1,
+            },
+          }),
+          { meta: true }
+        );
+      }
+      return;
+    }
+
+    setCustomBranchForReportId(null);
+    mutateReport(
+      (prev) => {
+        const nextSeq = computeNextBranchReportSequence(
+          selectedValue,
+          prev.meta.dateOfInspection,
+          allKnownReportRecords,
+          prev.id
+        );
+        return {
+          ...prev,
+          updatedAt: new Date().toISOString(),
+          meta: {
+            ...prev.meta,
+            storeLocation: selectedValue,
+            reportSequence: nextSeq,
+          },
+        };
+      },
+      { meta: true }
+    );
+  };
+
+  const handleCustomBranchChange = (customValue: string) => {
+    mutateReport(
+      (prev) => {
+        const nextSeq = computeNextBranchReportSequence(
+          customValue,
+          prev.meta.dateOfInspection,
+          allKnownReportRecords,
+          prev.id
+        );
+        return {
+          ...prev,
+          updatedAt: new Date().toISOString(),
+          meta: {
+            ...prev.meta,
+            storeLocation: customValue,
+            reportSequence: nextSeq,
+          },
+        };
+      },
+      { meta: true }
+    );
   };
 
   const updateItemResponse = (itemNumber: number, next: ItemResponse) => {
-    mutateReport((prev) => ({
-      ...prev,
-      updatedAt: new Date().toISOString(),
-      responses: {
-        ...prev.responses,
-        [itemNumber]: next,
-      },
-    }));
+    mutateReport(
+      (prev) => ({
+        ...prev,
+        updatedAt: new Date().toISOString(),
+        responses: {
+          ...prev.responses,
+          [itemNumber]: next,
+        },
+      }),
+      { itemNumber }
+    );
   };
 
   const openCameraForItem = (itemNumber: number) => {
@@ -585,11 +1608,12 @@ export default function App() {
   };
 
   const uploadSinglePhotoTask = async (
-    activeUser: User,
+    activeUser: User | null,
     snapshotReport: InspectionReport,
     itemNumber: number,
     photo: PhotoProof
   ): Promise<boolean> => {
+    const activeUid = activeUser?.uid || effectiveUidRef.current;
     const MAX_ATTEMPTS = 3;
     const RETRY_DELAYS_MS = [700, 1800];
     const runToken = (uploadRunTokensRef.current.get(photo.id) ?? 0) + 1;
@@ -627,8 +1651,8 @@ export default function App() {
       reportId: snapshotReport.id,
       fileName: photo.fileName,
       payloadBytes,
-      uid: activeUser.uid,
-      emailVerified: activeUser.emailVerified,
+      uid: activeUid,
+      emailVerified: activeUser?.emailVerified ?? null,
       online: typeof navigator !== 'undefined' ? navigator.onLine : true,
     });
 
@@ -667,12 +1691,20 @@ export default function App() {
 
       try {
         const result = await uploadSinglePhotoImmediatelyOnline(
-          activeUser.uid,
+          activeUid,
           reportRef.current.id === snapshotReport.id
             ? reportRef.current
             : snapshotReport,
           itemNumber,
-          photo
+          photo,
+          {
+            reportOwnerId: activeCollaborationRef.current?.ownerId || activeUid,
+            actorName:
+              activeUser?.displayName ||
+              activeUser?.email ||
+              snapshotReport.meta.inspectedBy ||
+              'Inspector',
+          }
         );
 
         if (isStaleRun()) {
@@ -720,7 +1752,38 @@ export default function App() {
           const filtered = prev.filter((p) => p.id !== result.storedRecord.id);
           return [result.storedRecord, ...filtered];
         });
-        setLastSyncedAt(new Date().toISOString());
+        setLocalPhotos((prev) => {
+          const exists = prev.some(
+            (p) => p.id === photo.id || p.id === result.photoId
+          );
+          if (!exists) return [result.storedRecord, ...prev];
+          return prev.map((p) =>
+            p.id === photo.id || p.id === result.photoId
+              ? { ...p, ...result.storedRecord }
+              : p
+          );
+        });
+        const latestReport = reportRef.current;
+        void saveActiveDraftToDb(latestReport).catch(() => undefined);
+        if (result.reportId !== snapshotReport.id) {
+          void deleteSavedReportFromDb(snapshotReport.id).catch(() => undefined);
+        }
+        void saveReportSnapshotToDb(latestReport)
+          .then(() => {
+            setLocalReports((prev) => {
+              const filtered = prev.filter(
+                (r) => r.id !== latestReport.id && r.id !== snapshotReport.id
+              );
+              return [latestReport, ...filtered];
+            });
+          })
+          .catch(() => undefined);
+        const syncedIso = new Date().toISOString();
+        setLastSyncedAt(syncedIso);
+        persistActiveSyncState({
+          reportId: latestReport.id,
+          lastSyncedAt: syncedIso,
+        });
         return true;
       } catch (err) {
         lastErr = err;
@@ -784,7 +1847,7 @@ export default function App() {
       attemptLogs,
       authState: {
         signedIn: Boolean(activeUser),
-        uid: activeUser?.uid ?? null,
+        uid: activeUid,
         email: activeUser?.email ?? null,
         emailVerified: activeUser?.emailVerified ?? null,
       },
@@ -808,6 +1871,24 @@ export default function App() {
       );
     }
 
+    const isOfflineFailure =
+      typeof navigator !== 'undefined' && !navigator.onLine;
+    if (isOfflineFailure) {
+      patchPhotoUploadFields(
+        itemNumber,
+        photo.id,
+        {
+          uploadState: 'local',
+          uploadError: undefined,
+          uploadErrorCode: undefined,
+        },
+        [snapshotReport.id]
+      );
+      void saveActiveDraftToDb(reportRef.current).catch(() => undefined);
+      void saveReportSnapshotToDb(reportRef.current).catch(() => undefined);
+      return false;
+    }
+
     patchPhotoUploadFields(
       itemNumber,
       photo.id,
@@ -818,6 +1899,8 @@ export default function App() {
       },
       [snapshotReport.id]
     );
+    void saveActiveDraftToDb(reportRef.current).catch(() => undefined);
+    void saveReportSnapshotToDb(reportRef.current).catch(() => undefined);
 
     setUploadDiagnostics((prev) => [
       diagnosticEntry,
@@ -830,12 +1913,20 @@ export default function App() {
 
   const attachPhotosToItem = (itemNumber: number, newPhotos: PhotoProof[]) => {
     if (newPhotos.length === 0) return;
+    if (activeCollaborationRef.current?.accessRole === 'viewer') {
+      showToast('View-only shared report — duplicate to attach photos');
+      return;
+    }
 
     const activeUser = user;
+    const isOnlineNow =
+      typeof navigator === 'undefined' ? true : navigator.onLine;
+    const shouldUploadNow = isOnlineNow;
+
     const preparedPhotos: PhotoProof[] = newPhotos.map((ph) => ({
       ...ph,
       id: sanitizeId(ph.id, 'ph'),
-      uploadState: activeUser ? 'uploading' : 'local',
+      uploadState: shouldUploadNow ? 'uploading' : 'local',
       uploadError: undefined,
       uploadErrorCode: undefined,
     }));
@@ -858,17 +1949,30 @@ export default function App() {
     reportRef.current = nextReport;
     setReport(nextReport);
 
-    // Persist immediately to IndexedDB without waiting for debounce
-    void saveActiveDraftToDb(nextReport)
-      .then(() => loadAllStoredPhotosFromDb())
+    // Immediately auto-save BOTH active draft AND local report snapshot + photo vault in IndexedDB
+    void Promise.all([
+      saveActiveDraftToDb(nextReport),
+      saveReportSnapshotToDb(nextReport),
+    ])
+      .then(() => {
+        setLocalReports((prev) => {
+          const filtered = prev.filter((r) => r.id !== nextReport.id);
+          return [nextReport, ...filtered];
+        });
+        return loadAllStoredPhotosFromDb();
+      })
       .then((allPhotos) => setLocalPhotos(allPhotos))
-      .catch(() => {
-        // Ignore silent local backup error
+      .catch((err) => {
+        if (isLocalStorageQuotaError(err)) {
+          setStorageWarning(
+            'Device storage is nearly full — consider clearing old local snapshots.'
+          );
+        }
       });
 
-    if (activeUser) {
+    if (shouldUploadNow) {
       showToast(
-        `Uploading ${preparedPhotos.length} ${preparedPhotos.length === 1 ? 'photo' : 'photos'} for Item #${itemNumber}…`
+        `Auto-saving & syncing ${preparedPhotos.length} ${preparedPhotos.length === 1 ? 'photo' : 'photos'} (${hdUploadsEnabled ? 'HD' : 'Std'})…`
       );
       void (async () => {
         let succeeded = 0;
@@ -885,27 +1989,35 @@ export default function App() {
         }
         if (failed === 0 && succeeded > 0) {
           showToast(
-            `${succeeded} ${succeeded === 1 ? 'photo' : 'photos'} uploaded & saved online`
+            `${succeeded} ${succeeded === 1 ? 'photo' : 'photos'} auto-saved & synced to cloud`
           );
         } else if (failed > 0) {
-          showToast(
-            `${failed} ${failed === 1 ? 'photo' : 'photos'} failed to upload — see diagnostics panel`
-          );
+          setHasUnsavedCloudChanges(true);
+          if (typeof navigator === 'undefined' || navigator.onLine) {
+            void backgroundSyncServiceRef.current?.triggerSync('scheduled');
+            showToast(
+              `${failed} ${failed === 1 ? 'photo' : 'photos'} saved locally — retrying cloud sync automatically`
+            );
+          } else {
+            showToast(
+              `${failed} ${failed === 1 ? 'photo' : 'photos'} saved locally — will auto-sync when online`
+            );
+          }
         }
       })();
     } else {
       setHasUnsavedCloudChanges(true);
+      persistActiveSyncState({
+        reportId: nextReport.id,
+        hasUnsavedCloudChanges: true,
+      });
       showToast(
-        `Saved ${preparedPhotos.length} ${preparedPhotos.length === 1 ? 'photo' : 'photos'} locally — sign in with Google to upload online`
+        `Saved ${preparedPhotos.length} ${preparedPhotos.length === 1 ? 'photo' : 'photos'} locally — will auto-sync to cloud when online`
       );
     }
   };
 
   const retryPhotoUpload = (itemNumber: number, photoId: string) => {
-    if (!user) {
-      showToast('Sign in with Google to upload photos online');
-      return;
-    }
     const current = reportRef.current.responses[itemNumber];
     const target = current?.photos.find((p) => p.id === photoId);
     if (!target) {
@@ -952,79 +2064,205 @@ export default function App() {
     });
   };
 
-  const syncPendingOrFailedPhotos = (
-    activeUser: User,
-    includeLocal: boolean
-  ) => {
-    const targets: { itemNumber: number; photo: PhotoProof }[] = [];
-    for (const [numStr, resp] of Object.entries(reportRef.current.responses)) {
-      const itemNumber = Number(numStr);
-      for (const photo of resp.photos) {
-        if (
-          photo.uploadState === 'error' ||
-          (includeLocal && photo.uploadState === 'local')
-        ) {
-          targets.push({ itemNumber, photo });
+  // Background sync service listening to navigator 'online' / 'offline', visibility events,
+  // and periodic sweep checks to automatically sync any 'error' or 'local' photos
+  // across BOTH the active draft AND saved local reports.
+  useEffect(() => {
+    const getPendingPhotos = (): BackgroundSyncPhotoItem[] => {
+      const pending: BackgroundSyncPhotoItem[] = [];
+      const seenKeys = new Set<string>();
+
+      const activeRep = reportRef.current;
+      if (activeCollaborationRef.current?.accessRole !== 'viewer') {
+        for (const [numStr, resp] of Object.entries(activeRep.responses)) {
+          const itemNumber = Number(numStr);
+          for (const photo of resp.photos) {
+            if (photo.uploadState === 'error' || photo.uploadState === 'local') {
+              const key = `${activeRep.id}:${photo.id}`;
+              if (!seenKeys.has(key)) {
+                seenKeys.add(key);
+                pending.push({ reportId: activeRep.id, itemNumber, photo });
+              }
+            }
+          }
         }
       }
-    }
-    if (targets.length === 0) return;
 
-    console.info('[PhotoUpload] Batch sync/retry started', {
-      count: targets.length,
-      includeLocal,
-      photoIds: targets.map((t) => t.photo.id),
+      // Also collect unsynced photos from saved local snapshots so no photo is left behind
+      for (const localRep of localReportsRef.current) {
+        if (localRep.id === activeRep.id) continue;
+        const sharedSummary = sharedReportsRef.current.find(
+          (r) => r.id === localRep.id
+        );
+        if (sharedSummary && sharedSummary.accessRole === 'viewer') continue;
+
+        for (const [numStr, resp] of Object.entries(localRep.responses)) {
+          const itemNumber = Number(numStr);
+          for (const photo of resp.photos) {
+            if (photo.uploadState === 'error' || photo.uploadState === 'local') {
+              const key = `${localRep.id}:${photo.id}`;
+              if (!seenKeys.has(key)) {
+                seenKeys.add(key);
+                pending.push({ reportId: localRep.id, itemNumber, photo });
+              }
+            }
+          }
+        }
+      }
+
+      return pending;
+    };
+
+    const service = new PhotoBackgroundSyncService({
+      getPendingPhotos,
+      canSync: () =>
+        Boolean(effectiveUidRef.current) &&
+        (typeof navigator === 'undefined' || navigator.onLine),
+      uploadPhoto: async ({ reportId, itemNumber, photo }) => {
+        const activeUser = userRef.current;
+        const activeUid = activeUser?.uid || effectiveUidRef.current;
+        if (!activeUid) return false;
+
+        // Active draft photo -> reuse full upload task with live status badges
+        if (reportId === reportRef.current.id) {
+          const cleanPhoto: PhotoProof = {
+            ...photo,
+            uploadState: 'uploading',
+            uploadError: undefined,
+            uploadErrorCode: undefined,
+          };
+          return uploadSinglePhotoTask(
+            activeUser,
+            reportRef.current,
+            itemNumber,
+            cleanPhoto
+          );
+        }
+
+        // Inactive saved local report photo -> upload directly & persist synced state back into IndexedDB
+        const targetLocalReport = localReportsRef.current.find(
+          (r) => r.id === reportId
+        );
+        if (!targetLocalReport) return false;
+
+        const sharedMatch = sharedReportsRef.current.find(
+          (r) => r.id === targetLocalReport.id
+        );
+        if (sharedMatch && sharedMatch.accessRole === 'viewer') return false;
+
+        try {
+          const result = await uploadSinglePhotoImmediatelyOnline(
+            activeUid,
+            targetLocalReport,
+            itemNumber,
+            photo,
+            {
+              reportOwnerId: sharedMatch?.ownerId || activeUid,
+              actorName:
+                activeUser?.displayName ||
+                activeUser?.email ||
+                targetLocalReport.meta.inspectedBy ||
+                'Inspector',
+            }
+          );
+
+          const currResp = targetLocalReport.responses[itemNumber];
+          if (currResp) {
+            const updatedSnap: InspectionReport = {
+              ...targetLocalReport,
+              id: result.reportId,
+              responses: {
+                ...targetLocalReport.responses,
+                [itemNumber]: {
+                  ...currResp,
+                  photos: currResp.photos.map((p) =>
+                    p.id === photo.id || p.id === result.photoId
+                      ? {
+                          ...p,
+                          id: result.photoId,
+                          dataUrl: result.safeDataUrl,
+                          uploadState: 'synced' as const,
+                          uploadError: undefined,
+                          uploadErrorCode: undefined,
+                        }
+                      : p
+                  ),
+                },
+              },
+            };
+            await saveReportSnapshotToDb(updatedSnap).catch(() => undefined);
+            setLocalReports((prev) =>
+              prev.map((r) => (r.id === targetLocalReport.id ? updatedSnap : r))
+            );
+          }
+
+          setCloudPhotos((prev) => {
+            const filtered = prev.filter((p) => p.id !== result.storedRecord.id);
+            return [result.storedRecord, ...filtered];
+          });
+          setLocalPhotos((prev) => {
+            const exists = prev.some(
+              (p) => p.id === photo.id || p.id === result.photoId
+            );
+            if (!exists) return [result.storedRecord, ...prev];
+            return prev.map((p) =>
+              p.id === photo.id || p.id === result.photoId
+                ? { ...p, ...result.storedRecord }
+                : p
+            );
+          });
+          setLastSyncedAt(new Date().toISOString());
+          return true;
+        } catch (err) {
+          console.warn('[BackgroundSync] Saved report photo sync failed:', {
+            reportId,
+            photoId: photo.id,
+            err,
+          });
+          return false;
+        }
+      },
+      onStateChange: (nextState) => {
+        setBackgroundSyncState(nextState);
+      },
+      onSweepComplete: ({ trigger, succeeded, failed }) => {
+        if (succeeded > 0 && failed === 0) {
+          showToast(
+            trigger === 'online'
+              ? `Back online — auto-synced ${succeeded} ${succeeded === 1 ? 'photo' : 'photos'}`
+              : `${succeeded} ${succeeded === 1 ? 'photo' : 'photos'} auto-synced to cloud`
+          );
+        } else if (failed > 0 && trigger !== 'scheduled') {
+          showToast(
+            `${failed} ${failed === 1 ? 'photo' : 'photos'} still failed — see diagnostics panel`
+          );
+        }
+      },
     });
 
-    for (const { itemNumber, photo } of targets) {
-      patchPhotoUploadFields(itemNumber, photo.id, {
-        uploadState: 'uploading',
-        uploadError: undefined,
-        uploadErrorCode: undefined,
-      });
-    }
+    backgroundSyncServiceRef.current = service;
+    service.start();
 
-    showToast(
-      `Syncing ${targets.length} pending ${targets.length === 1 ? 'photo' : 'photos'} online…`
-    );
+    return () => {
+      service.stop();
+      backgroundSyncServiceRef.current = null;
+    };
+  }, []);
 
-    void (async () => {
-      let okCount = 0;
-      let failCount = 0;
-      for (const { itemNumber, photo } of targets) {
-        const cleanPhoto: PhotoProof = {
-          ...photo,
-          uploadState: 'uploading',
-          uploadError: undefined,
-          uploadErrorCode: undefined,
-        };
-        const ok = await uploadSinglePhotoTask(
-          activeUser,
-          reportRef.current,
-          itemNumber,
-          cleanPhoto
-        );
-        if (ok) okCount++;
-        else failCount++;
-      }
-      if (failCount === 0 && okCount > 0) {
-        showToast(
-          `${okCount} ${okCount === 1 ? 'photo' : 'photos'} synced online`
-        );
-      } else if (failCount > 0) {
-        showToast(
-          `${failCount} ${failCount === 1 ? 'photo' : 'photos'} still failed — see diagnostics panel`
-        );
-      }
-    })();
-  };
+  // Automatically trigger background sync on startup / sign-in when offline-cached
+  // 'error' or 'local' photos exist on the active report or any saved local reports.
+  useEffect(() => {
+    if (!isHydrated || !authReady) return;
+    if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+    void backgroundSyncServiceRef.current?.triggerSync('signin');
+  }, [isHydrated, authReady, effectiveUid]);
 
   const retryAllFailedPhotos = () => {
-    if (!user) {
-      showToast('Sign in with Google to upload photos online');
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      showToast('You are offline — background sync will run when back online');
       return;
     }
-    syncPendingOrFailedPhotos(user, true);
+    void backgroundSyncServiceRef.current?.triggerSync('manual');
   };
 
   const updatePhotoCaption = (
@@ -1032,43 +2270,55 @@ export default function App() {
     photoId: string,
     caption: string
   ) => {
-    mutateReport((prev) => {
-      const current = prev.responses[itemNumber] ?? createEmptyResponse();
-      return {
-        ...prev,
-        updatedAt: new Date().toISOString(),
-        responses: {
-          ...prev.responses,
-          [itemNumber]: {
-            ...current,
-            photos: current.photos.map((p) =>
-              p.id === photoId ? { ...p, caption } : p
-            ),
+    mutateReport(
+      (prev) => {
+        const current = prev.responses[itemNumber] ?? createEmptyResponse();
+        return {
+          ...prev,
+          updatedAt: new Date().toISOString(),
+          responses: {
+            ...prev.responses,
+            [itemNumber]: {
+              ...current,
+              photos: current.photos.map((p) =>
+                p.id === photoId ? { ...p, caption } : p
+              ),
+            },
           },
-        },
-      };
-    });
+        };
+      },
+      { photoId }
+    );
+
+    setLocalPhotos((prev) =>
+      prev.map((p) => (p.id === photoId ? { ...p, caption } : p))
+    );
+    setCloudPhotos((prev) =>
+      prev.map((p) => (p.id === photoId ? { ...p, caption } : p))
+    );
 
     // If this photo is already synced online, debounce-sync its caption immediately
-    if (user) {
-      const targetPhoto = reportRef.current.responses[itemNumber]?.photos.find(
-        (p) => p.id === photoId
-      );
-      if (targetPhoto?.uploadState === 'synced') {
-        const existingTimer = captionTimersRef.current.get(photoId);
-        if (existingTimer) window.clearTimeout(existingTimer);
-        const timerId = window.setTimeout(() => {
-          captionTimersRef.current.delete(photoId);
-          void updatePhotoCaptionOnline(
-            reportRef.current.id,
-            photoId,
-            caption
-          ).catch(() => {
-            // Silent fallback — will also sync on Save Online
+    const targetPhoto = reportRef.current.responses[itemNumber]?.photos.find(
+      (p) => p.id === photoId
+    );
+    if (targetPhoto?.uploadState === 'synced') {
+      const existingTimer = captionTimersRef.current.get(photoId);
+      if (existingTimer) window.clearTimeout(existingTimer);
+      const timerId = window.setTimeout(() => {
+        captionTimersRef.current.delete(photoId);
+        void updatePhotoCaptionOnline(
+          reportRef.current.id,
+          photoId,
+          caption
+        )
+          .then(() => {
+            dirtyFieldsRef.current.photoIds.delete(photoId);
+          })
+          .catch(() => {
+            // Keeps photoId in dirtyFieldsRef so autosave / reconnect flushes it cleanly
           });
-        }, 650);
-        captionTimersRef.current.set(photoId, timerId);
-      }
+      }, 650);
+      captionTimersRef.current.set(photoId, timerId);
     }
   };
 
@@ -1076,36 +2326,63 @@ export default function App() {
     itemNumber: number,
     photoId: string
   ) => {
+    if (activeCollaborationRef.current?.accessRole === 'viewer') {
+      showToast('View-only shared report — duplicate to modify photos');
+      return;
+    }
     const activeReportId = reportRef.current.id;
     uploadRunTokensRef.current.delete(photoId);
     setUploadDiagnostics((prev) => prev.filter((d) => d.photoId !== photoId));
-    mutateReport((prev) => {
-      const current = prev.responses[itemNumber] ?? createEmptyResponse();
-      return {
-        ...prev,
-        updatedAt: new Date().toISOString(),
-        responses: {
-          ...prev.responses,
-          [itemNumber]: {
-            ...current,
-            photos: current.photos.filter((p) => p.id !== photoId),
+    mutateReport(
+      (prev) => {
+        const current = prev.responses[itemNumber] ?? createEmptyResponse();
+        return {
+          ...prev,
+          updatedAt: new Date().toISOString(),
+          responses: {
+            ...prev.responses,
+            [itemNumber]: {
+              ...current,
+              photos: current.photos.filter((p) => p.id !== photoId),
+            },
           },
-        },
-      };
-    });
+        };
+      },
+      { itemNumber }
+    );
     try {
       await deleteStoredPhotoFromDb(photoId);
       setLocalPhotos((prev) => prev.filter((p) => p.id !== photoId));
     } catch {
       // ignore
     }
+    const localMatch = localReports.find((rep) => rep.id === activeReportId);
+    if (localMatch) {
+      const curr = localMatch.responses[itemNumber];
+      if (curr && curr.photos.some((p) => p.id === photoId)) {
+        const updatedSnap: InspectionReport = {
+          ...localMatch,
+          responses: {
+            ...localMatch.responses,
+            [itemNumber]: {
+              ...curr,
+              photos: curr.photos.filter((p) => p.id !== photoId),
+            },
+          },
+        };
+        await saveReportSnapshotToDb(updatedSnap).catch(() => undefined);
+        setLocalReports((prev) =>
+          prev.map((r) => (r.id === updatedSnap.id ? updatedSnap : r))
+        );
+      }
+    }
     if (
-      user &&
-      (cloudReports.some((r) => r.id === activeReportId) ||
-        cloudPhotos.some((p) => p.id === photoId))
+      cloudReports.some((r) => r.id === activeReportId) ||
+      sharedReports.some((r) => r.id === activeReportId) ||
+      cloudPhotos.some((p) => p.id === photoId)
     ) {
       try {
-        await deleteSinglePhotoOnline(user.uid, activeReportId, photoId);
+        await deleteSinglePhotoOnline(effectiveUid, activeReportId, photoId);
         setCloudPhotos((prev) => prev.filter((p) => p.id !== photoId));
       } catch {
         // ignore if photo hadn't been synced yet
@@ -1115,37 +2392,70 @@ export default function App() {
 
   const deleteStoredPhotoRecord = async (record: StoredPhotoRecord) => {
     uploadRunTokensRef.current.delete(record.id);
+    const captionTimer = captionTimersRef.current.get(record.id);
+    if (captionTimer) {
+      window.clearTimeout(captionTimer);
+      captionTimersRef.current.delete(record.id);
+    }
     setUploadDiagnostics((prev) => {
       const next = prev.filter((d) => d.photoId !== record.id);
       if (next.length === 0) setDiagnosticsOverlayOpen(false);
       return next;
     });
-    mutateReport((prev) => {
-      const current = prev.responses[record.itemNumber];
-      if (!current || !current.photos.some((p) => p.id === record.id)) {
-        return prev;
-      }
-      return {
-        ...prev,
-        updatedAt: new Date().toISOString(),
-        responses: {
-          ...prev.responses,
-          [record.itemNumber]: {
-            ...current,
-            photos: current.photos.filter((p) => p.id !== record.id),
+    mutateReport(
+      (prev) => {
+        const current = prev.responses[record.itemNumber];
+        if (!current || !current.photos.some((p) => p.id === record.id)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          updatedAt: new Date().toISOString(),
+          responses: {
+            ...prev.responses,
+            [record.itemNumber]: {
+              ...current,
+              photos: current.photos.filter((p) => p.id !== record.id),
+            },
           },
-        },
-      };
-    });
+        };
+      },
+      { itemNumber: record.itemNumber }
+    );
     try {
       await deleteStoredPhotoFromDb(record.id);
       setLocalPhotos((prev) => prev.filter((p) => p.id !== record.id));
     } catch {
       // ignore
     }
-    if (user && cloudReports.some((r) => r.id === record.reportId)) {
+    const affectedSnapshot = localReports.find((rep) =>
+      rep.id === record.reportId &&
+      rep.responses[record.itemNumber]?.photos.some((p) => p.id === record.id)
+    );
+    if (affectedSnapshot) {
+      const curr = affectedSnapshot.responses[record.itemNumber];
+      const updatedSnap: InspectionReport = {
+        ...affectedSnapshot,
+        responses: {
+          ...affectedSnapshot.responses,
+          [record.itemNumber]: {
+            ...curr,
+            photos: curr.photos.filter((p) => p.id !== record.id),
+          },
+        },
+      };
+      await saveReportSnapshotToDb(updatedSnap).catch(() => undefined);
+      setLocalReports((prev) =>
+        prev.map((r) => (r.id === updatedSnap.id ? updatedSnap : r))
+      );
+    }
+    if (
+      cloudReports.some((r) => r.id === record.reportId) ||
+      sharedReports.some((r) => r.id === record.reportId) ||
+      cloudPhotos.some((p) => p.id === record.id)
+    ) {
       try {
-        await deleteSinglePhotoOnline(user.uid, record.reportId, record.id);
+        await deleteSinglePhotoOnline(effectiveUid, record.reportId, record.id);
         setCloudPhotos((prev) => prev.filter((p) => p.id !== record.id));
       } catch {
         // handled by cloudReports
@@ -1154,23 +2464,314 @@ export default function App() {
     showToast('Photo removed');
   };
 
+  const bulkDeleteStoredPhotos = async (records: StoredPhotoRecord[]) => {
+    if (records.length === 0) return;
+
+    const editableRecords = records.filter((rec) => {
+      if (
+        rec.reportId === reportRef.current.id &&
+        activeCollaborationRef.current?.accessRole === 'viewer'
+      ) {
+        return false;
+      }
+      const sharedSummary = sharedReports.find((r) => r.id === rec.reportId);
+      if (sharedSummary && sharedSummary.accessRole === 'viewer') {
+        return false;
+      }
+      return true;
+    });
+
+    if (editableRecords.length === 0) {
+      showToast('Selected photos belong to view-only shared reports');
+      return;
+    }
+
+    const deleteIdSet = new Set(editableRecords.map((r) => r.id));
+
+    for (const id of deleteIdSet) {
+      uploadRunTokensRef.current.delete(id);
+      const timer = captionTimersRef.current.get(id);
+      if (timer) {
+        window.clearTimeout(timer);
+        captionTimersRef.current.delete(id);
+      }
+    }
+
+    setUploadDiagnostics((prev) => {
+      const next = prev.filter((d) => !deleteIdSet.has(d.photoId));
+      if (next.length === 0) setDiagnosticsOverlayOpen(false);
+      return next;
+    });
+
+    // Update active report if any selected photos belong to it
+    const activeHasMatch = Object.values(reportRef.current.responses).some((r) =>
+      r.photos.some((p) => deleteIdSet.has(p.id))
+    );
+    if (activeHasMatch) {
+      mutateReport((prev) => {
+        let changed = false;
+        const nextResponses = { ...prev.responses };
+        for (const [keyStr, resp] of Object.entries(prev.responses)) {
+          const itemNum = Number(keyStr);
+          const filtered = resp.photos.filter((p) => !deleteIdSet.has(p.id));
+          if (filtered.length !== resp.photos.length) {
+            changed = true;
+            nextResponses[itemNum] = { ...resp, photos: filtered };
+          }
+        }
+        if (!changed) return prev;
+        return {
+          ...prev,
+          updatedAt: new Date().toISOString(),
+          responses: nextResponses,
+        };
+      });
+    }
+
+    // Remove from local IndexedDB photo store & saved local report snapshots
+    await Promise.allSettled(
+      editableRecords.map((rec) => deleteStoredPhotoFromDb(rec.id))
+    );
+    setLocalPhotos((prev) => prev.filter((p) => !deleteIdSet.has(p.id)));
+
+    const affectedLocalSnapshots = localReports.filter((rep) =>
+      Object.values(rep.responses).some((r) =>
+        r.photos.some((p) => deleteIdSet.has(p.id))
+      )
+    );
+    if (affectedLocalSnapshots.length > 0) {
+      const updatedSnapshots = affectedLocalSnapshots.map((rep) => {
+        const nextResponses = { ...rep.responses };
+        for (const [keyStr, resp] of Object.entries(rep.responses)) {
+          const itemNum = Number(keyStr);
+          const filtered = resp.photos.filter((p) => !deleteIdSet.has(p.id));
+          if (filtered.length !== resp.photos.length) {
+            nextResponses[itemNum] = { ...resp, photos: filtered };
+          }
+        }
+        return { ...rep, responses: nextResponses };
+      });
+      await Promise.allSettled(
+        updatedSnapshots.map((snap) => saveReportSnapshotToDb(snap))
+      );
+      const updatedById = new Map(updatedSnapshots.map((s) => [s.id, s]));
+      setLocalReports((prev) => prev.map((r) => updatedById.get(r.id) ?? r));
+    }
+
+    // Remove synced photos from Firestore in one batched operation per report
+    const cloudCandidates = editableRecords.filter(
+      (rec) =>
+        cloudReports.some((r) => r.id === rec.reportId) ||
+        sharedReports.some((r) => r.id === rec.reportId) ||
+        cloudPhotos.some((p) => p.id === rec.id)
+    );
+    if (cloudCandidates.length > 0) {
+      const byReport = new Map<string, string[]>();
+      for (const rec of cloudCandidates) {
+        const list = byReport.get(rec.reportId) ?? [];
+        list.push(rec.id);
+        byReport.set(rec.reportId, list);
+      }
+      await Promise.allSettled(
+        Array.from(byReport.entries()).map(([repId, ids]) =>
+          deletePhotosBatchOnline(effectiveUid, repId, ids)
+        )
+      );
+      setCloudPhotos((prev) => prev.filter((p) => !deleteIdSet.has(p.id)));
+    }
+
+    const skippedCount = records.length - editableRecords.length;
+    showToast(
+      skippedCount > 0
+        ? `Removed ${editableRecords.length} ${editableRecords.length === 1 ? 'photo' : 'photos'} (${skippedCount} view-only skipped)`
+        : `Removed ${editableRecords.length} ${editableRecords.length === 1 ? 'photo' : 'photos'}`
+    );
+  };
+
+  const bulkRecaptionStoredPhotos = async (
+    records: StoredPhotoRecord[],
+    rawCaption: string
+  ) => {
+    if (records.length === 0) return;
+
+    const editableRecords = records.filter((rec) => {
+      if (
+        rec.reportId === reportRef.current.id &&
+        activeCollaborationRef.current?.accessRole === 'viewer'
+      ) {
+        return false;
+      }
+      const sharedSummary = sharedReports.find((r) => r.id === rec.reportId);
+      if (sharedSummary && sharedSummary.accessRole === 'viewer') {
+        return false;
+      }
+      return true;
+    });
+
+    if (editableRecords.length === 0) {
+      showToast('Selected photos belong to view-only shared reports');
+      return;
+    }
+
+    const nextCaption = rawCaption.trim().slice(0, 500);
+    const targetIdSet = new Set(editableRecords.map((r) => r.id));
+
+    for (const id of targetIdSet) {
+      const timer = captionTimersRef.current.get(id);
+      if (timer) {
+        window.clearTimeout(timer);
+        captionTimersRef.current.delete(id);
+      }
+    }
+
+    // Update active report photos in one batch if matched
+    const activeHasMatch = Object.values(reportRef.current.responses).some((r) =>
+      r.photos.some((p) => targetIdSet.has(p.id))
+    );
+    if (activeHasMatch) {
+      mutateReport((prev) => {
+        let changed = false;
+        const nextResponses = { ...prev.responses };
+        for (const [keyStr, resp] of Object.entries(prev.responses)) {
+          const itemNum = Number(keyStr);
+          if (resp.photos.some((p) => targetIdSet.has(p.id))) {
+            changed = true;
+            nextResponses[itemNum] = {
+              ...resp,
+              photos: resp.photos.map((p) =>
+                targetIdSet.has(p.id) ? { ...p, caption: nextCaption } : p
+              ),
+            };
+          }
+        }
+        if (!changed) return prev;
+        return {
+          ...prev,
+          updatedAt: new Date().toISOString(),
+          responses: nextResponses,
+        };
+      });
+    }
+
+    // Update local IndexedDB photo records & local saved snapshots
+    await Promise.allSettled(
+      editableRecords.map((rec) =>
+        upsertStoredPhotoInDb({ ...rec, caption: nextCaption })
+      )
+    );
+    setLocalPhotos((prev) =>
+      prev.map((p) =>
+        targetIdSet.has(p.id) ? { ...p, caption: nextCaption } : p
+      )
+    );
+
+    const affectedLocalSnapshots = localReports.filter((rep) =>
+      Object.values(rep.responses).some((r) =>
+        r.photos.some((p) => targetIdSet.has(p.id))
+      )
+    );
+    if (affectedLocalSnapshots.length > 0) {
+      const updatedSnapshots = affectedLocalSnapshots.map((rep) => {
+        const nextResponses = { ...rep.responses };
+        for (const [keyStr, resp] of Object.entries(rep.responses)) {
+          const itemNum = Number(keyStr);
+          if (resp.photos.some((p) => targetIdSet.has(p.id))) {
+            nextResponses[itemNum] = {
+              ...resp,
+              photos: resp.photos.map((p) =>
+                targetIdSet.has(p.id) ? { ...p, caption: nextCaption } : p
+              ),
+            };
+          }
+        }
+        return { ...rep, responses: nextResponses };
+      });
+      await Promise.allSettled(
+        updatedSnapshots.map((snap) => saveReportSnapshotToDb(snap))
+      );
+      const updatedById = new Map(updatedSnapshots.map((s) => [s.id, s]));
+      setLocalReports((prev) => prev.map((r) => updatedById.get(r.id) ?? r));
+    }
+
+    // Update Firestore photo documents in one batch per report when online
+    let cloudSyncFailed = 0;
+    const cloudCandidates = editableRecords.filter(
+      (rec) =>
+        cloudPhotos.some((p) => p.id === rec.id) ||
+        cloudReports.some((r) => r.id === rec.reportId) ||
+        sharedReports.some((r) => r.id === rec.reportId)
+    );
+    if (cloudCandidates.length > 0) {
+      const byReport = new Map<string, Array<{ photoId: string; caption: string }>>();
+      for (const rec of cloudCandidates) {
+        const list = byReport.get(rec.reportId) ?? [];
+        list.push({ photoId: rec.id, caption: nextCaption });
+        byReport.set(rec.reportId, list);
+      }
+      const results = await Promise.allSettled(
+        Array.from(byReport.entries()).map(([repId, updates]) =>
+          updatePhotosCaptionBatchOnline(repId, updates)
+        )
+      );
+      for (let i = 0; i < results.length; i++) {
+        if (results[i].status === 'rejected') {
+          const entries = Array.from(byReport.values())[i] ?? [];
+          cloudSyncFailed += entries.length;
+        }
+      }
+      setCloudPhotos((prev) =>
+        prev.map((p) =>
+          targetIdSet.has(p.id) ? { ...p, caption: nextCaption } : p
+        )
+      );
+    }
+
+    const skippedCount = records.length - editableRecords.length;
+    if (cloudSyncFailed > 0) {
+      showToast(
+        `Updated captions locally for ${editableRecords.length} ${editableRecords.length === 1 ? 'photo' : 'photos'} (${cloudSyncFailed} pending cloud sync)`
+      );
+    } else if (skippedCount > 0) {
+      showToast(
+        `Updated captions for ${editableRecords.length} ${editableRecords.length === 1 ? 'photo' : 'photos'} (${skippedCount} view-only skipped)`
+      );
+    } else {
+      showToast(
+        nextCaption
+          ? `Updated caption for ${editableRecords.length} ${editableRecords.length === 1 ? 'photo' : 'photos'}`
+          : `Cleared caption for ${editableRecords.length} ${editableRecords.length === 1 ? 'photo' : 'photos'}`
+      );
+    }
+  };
+
   const handleSignIn = async () => {
     setIsSigningIn(true);
+    setAuthError(null);
     try {
       const cred = await signInWithGoogle();
       setStorageWarning(null);
+      setAuthError(null);
       showToast('Signed in with Google — online cloud storage enabled');
       if (cred.user) {
-        syncPendingOrFailedPhotos(cred.user, true);
+        userRef.current = cred.user;
+        void backgroundSyncServiceRef.current?.triggerSync('signin');
       }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       if (msg.includes('unauthorized-domain')) {
-        setStorageWarning(
-          `Sign-in blocked on "${window.location.hostname}". Add this domain to Firebase Console → Authentication → Settings → Authorized domains.`
-        );
+        const domainMsg = `Sign-in blocked on "${window.location.hostname}". Add this domain to Firebase Console → Authentication → Settings → Authorized domains.`;
+        setStorageWarning(domainMsg);
+        setAuthError(domainMsg);
+      } else if (msg.includes('popup-blocked')) {
+        const popupMsg =
+          'Sign-in popup was blocked by your browser. Please allow popups for this site and try again.';
+        setAuthError(popupMsg);
+        showToast(popupMsg);
       } else if (!msg.includes('popup-closed-by-user')) {
-        showToast('Sign-in failed. Please allow popups and try again.');
+        const fallbackMsg =
+          'Google sign-in could not be completed. Please allow popups and try again.';
+        setAuthError(fallbackMsg);
+        showToast(fallbackMsg);
       }
     } finally {
       setIsSigningIn(false);
@@ -1178,81 +2779,431 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
+    backgroundSyncServiceRef.current?.resetBackoff();
     clearCloudReportCache();
+    setAuthError(null);
     await signOutUser();
     showToast('Signed out');
   };
 
-  // Save current report (online to Firestore if signed in, plus local IndexedDB snapshot)
+  // Save current report (online to Firestore if signed in & online, plus local IndexedDB snapshot)
   const handleSaveCurrentReport = async () => {
+    if (isReadOnlyViewer) {
+      showToast('View-only shared report — click Duplicate to save your own copy');
+      return;
+    }
+    if (cloudAutosaveTimerRef.current) {
+      window.clearTimeout(cloudAutosaveTimerRef.current);
+      cloudAutosaveTimerRef.current = null;
+    }
+    if (autosaveRetryTimerRef.current) {
+      window.clearTimeout(autosaveRetryTimerRef.current);
+      autosaveRetryTimerRef.current = null;
+    }
+    // Clear any pending debounced caption timers since full save writes all captions
+    for (const timerId of captionTimersRef.current.values()) {
+      window.clearTimeout(timerId);
+    }
+    captionTimersRef.current.clear();
+
     setIsSavingOnline(true);
     setStorageWarning(null);
-    try {
-      const snapshot: InspectionReport = {
-        ...report,
-        updatedAt: new Date().toISOString(),
-      };
+    const isOnlineNow =
+      typeof navigator === 'undefined' ? true : navigator.onLine;
 
-      await saveReportSnapshotToDb(snapshot);
-      setLocalReports((prev) => {
-        const filtered = prev.filter((r) => r.id !== snapshot.id);
-        return [snapshot, ...filtered];
+    try {
+      const baseReport = withResolvedSequence({
+        ...reportRef.current,
+        updatedAt: new Date().toISOString(),
       });
 
-      if (user) {
-        const savedOnline = await saveReportOnline(user.uid, snapshot);
-        setReport(savedOnline);
-        setHasUnsavedCloudChanges(false);
-        setLastSyncedAt(new Date().toISOString());
-        // Clear diagnostic entries for any photos that successfully synced during full save
-        const syncedPhotoIds = new Set<string>();
-        for (const resp of Object.values(savedOnline.responses)) {
-          for (const ph of resp.photos) {
-            if (ph.uploadState === 'synced') {
-              syncedPhotoIds.add(ph.id);
+      // When offline, normalize any in-flight 'uploading' photos to 'local' so background sync picks them up cleanly
+      const snapshot: InspectionReport = isOnlineNow
+        ? baseReport
+        : {
+            ...baseReport,
+            responses: Object.fromEntries(
+              Object.entries(baseReport.responses).map(([k, resp]) => [
+                Number(k),
+                {
+                  ...resp,
+                  photos: resp.photos.map((ph) =>
+                    ph.uploadState === 'uploading'
+                      ? {
+                          ...ph,
+                          uploadState: 'local' as const,
+                          uploadError: undefined,
+                          uploadErrorCode: undefined,
+                        }
+                      : ph
+                  ),
+                },
+              ])
+            ),
+          };
+
+      try {
+        await saveReportSnapshotToDb(snapshot);
+        await saveActiveDraftToDb(snapshot);
+        setLocalReports((prev) => {
+          const filtered = prev.filter((r) => r.id !== snapshot.id);
+          return [snapshot, ...filtered];
+        });
+        const refreshedLocal = await loadAllStoredPhotosFromDb();
+        setLocalPhotos(refreshedLocal);
+      } catch (localErr) {
+        if (isLocalStorageQuotaError(localErr)) {
+          setStorageWarning(
+            'Device storage is full — saving online, consider clearing old local snapshots.'
+          );
+        }
+      }
+
+      if (!isOnlineNow) {
+        setReport(snapshot);
+        setHasUnsavedCloudChanges(true);
+        persistActiveSyncState({
+          reportId: snapshot.id,
+          hasUnsavedCloudChanges: true,
+        });
+        showToast(
+          'Saved locally offline — report & photos will auto-sync when online'
+        );
+        return;
+      }
+
+      const collab = activeCollaborationRef.current;
+      const actorName =
+        user?.displayName ||
+        user?.email ||
+        snapshot.meta.inspectedBy ||
+        'Inspector';
+      const nextSyncVersion = (collab?.syncVersion ?? 0) + 1;
+      const {
+        report: savedOnline,
+        syncVersion,
+        failedPhotoCount,
+      } = await saveReportOnline(effectiveUid, snapshot, {
+        actorName,
+        reportOwnerId: collab?.ownerId || effectiveUid,
+        nextSyncVersion,
+      });
+
+      // Persist updated 'synced' photo states & normalized signatures back into IndexedDB
+      const idbOps: Array<Promise<unknown>> = [
+        saveReportSnapshotToDb(savedOnline),
+        saveActiveDraftToDb(savedOnline),
+      ];
+      if (savedOnline.id !== snapshot.id) {
+        idbOps.push(deleteSavedReportFromDb(snapshot.id));
+      }
+      await Promise.allSettled(idbOps);
+      const refreshedLocalPhotos = await loadAllStoredPhotosFromDb();
+      setLocalPhotos(refreshedLocalPhotos);
+      setLocalReports((prev) => {
+        const filtered = prev.filter(
+          (r) => r.id !== savedOnline.id && r.id !== snapshot.id
+        );
+        return [savedOnline, ...filtered];
+      });
+
+      const syncedIso = new Date().toISOString();
+      setReport(savedOnline);
+      setLastCloudSaveError(null);
+      setHasUnsavedCloudChanges(failedPhotoCount > 0);
+      setRemoteUpdateNotice(null);
+      resetDirtyTracker();
+      setLastSyncedAt(syncedIso);
+      persistActiveSyncState({
+        reportId: savedOnline.id,
+        hasUnsavedCloudChanges: failedPhotoCount > 0,
+        lastSyncedAt: syncedIso,
+      });
+      setActiveCollaboration((prev) =>
+        prev
+          ? {
+              ...prev,
+              syncVersion,
+              lastEditedByUid: effectiveUid,
+              lastEditedByName: actorName,
             }
+          : prev
+      );
+      // Clear diagnostic entries for any photos that successfully synced during full save
+      const syncedPhotoIds = new Set<string>();
+      for (const resp of Object.values(savedOnline.responses)) {
+        for (const ph of resp.photos) {
+          if (ph.uploadState === 'synced') {
+            syncedPhotoIds.add(ph.id);
           }
         }
-        if (syncedPhotoIds.size > 0) {
-          setUploadDiagnostics((prev) => {
-            const next = prev.filter((d) => !syncedPhotoIds.has(d.photoId));
-            if (next.length === 0) setDiagnosticsOverlayOpen(false);
-            return next;
-          });
-        }
-        // Refresh cloud photo vault
-        const idsToLoad = Array.from(
-          new Set([
-            ...cloudReports.filter((r) => r.stats.photoCount > 0).map((r) => r.id),
-            savedOnline.id,
-          ])
+      }
+      if (syncedPhotoIds.size > 0) {
+        setUploadDiagnostics((prev) => {
+          const next = prev.filter((d) => !syncedPhotoIds.has(d.photoId));
+          if (next.length === 0) setDiagnosticsOverlayOpen(false);
+          return next;
+        });
+      }
+
+      // Immediately update cloudPhotos in memory from savedOnline (zero extra network downloads)
+      const savedPhotoRecords = extractPhotoRecordsFromReport(savedOnline).filter(
+        (rec) => syncedPhotoIds.has(rec.id)
+      );
+      fetchedPhotoCountsRef.current.set(savedOnline.id, savedPhotoRecords.length);
+      setCloudPhotos((prev) => {
+        const kept = prev.filter(
+          (p) => p.reportId !== savedOnline.id && p.reportId !== snapshot.id
         );
-        const refreshedPhotos = await loadAllUserPhotosOnline(user.uid, idsToLoad);
-        setCloudPhotos(refreshedPhotos);
-        showToast('Report and photo proofs saved online');
+        const merged = [...savedPhotoRecords, ...kept];
+        merged.sort((a, b) =>
+          (b.capturedAt || '').localeCompare(a.capturedAt || '')
+        );
+        return merged;
+      });
+
+      // Also sweep any queued photos remaining on other saved local reports
+      if (otherReportsPendingPhotoCount > 0 || failedPhotoCount > 0) {
+        void backgroundSyncServiceRef.current?.triggerSync('scheduled');
+      }
+
+      if (failedPhotoCount > 0) {
+        showToast(
+          `Report saved online, ${failedPhotoCount} ${
+            failedPhotoCount === 1 ? 'photo' : 'photos'
+          } retrying automatically`
+        );
       } else {
-        showToast('Saved locally — sign in with Google to save online');
+        showToast('Report and all photo proofs saved online');
       }
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('Quota exceeded')) {
+      const details = extractFirebaseErrorDetails(err);
+      console.error('[SaveOnline] Failed to save report online:', {
+        code: details.code,
+        summary: details.friendlySummary,
+        path: details.path,
+        rawMessage: details.rawMessage,
+      });
+      setLastCloudSaveError({
+        code: details.code,
+        summary: details.friendlySummary,
+        detail: details.rawMessage,
+        at: new Date().toISOString(),
+      });
+      if (
+        details.code === 'resource-exhausted' ||
+        details.code === 'storage/quota-exceeded' ||
+        details.rawMessage.includes('Quota exceeded')
+      ) {
         setStorageWarning(
           'Daily Firestore free tier quota exceeded. Quota resets tomorrow; your work remains saved locally.'
         );
       } else {
-        showToast('Could not save report online. Check your connection.');
+        showToast(
+          `Saved locally — cloud sync failed (${details.friendlySummary})`
+        );
       }
     } finally {
       setIsSavingOnline(false);
     }
   };
 
+  const handleShareCurrentReport = async () => {
+    if (!user) {
+      showToast('Sign in with Google to share reports online');
+      return;
+    }
+    if (activeCollaboration && activeCollaboration.accessRole !== 'owner') {
+      showToast('Only the report owner can manage sharing permissions');
+      return;
+    }
+    // Ensure report exists online before opening Share dialog
+    const existing = cloudReports.find((r) => r.id === report.id);
+    if (!existing) {
+      setIsSavingOnline(true);
+      try {
+        const actorName =
+          user.displayName || user.email || report.meta.inspectedBy || 'Inspector';
+        const { report: savedOnline } = await saveReportOnline(user.uid, report, {
+          actorName,
+          reportOwnerId: user.uid,
+          nextSyncVersion: 1,
+        });
+        setReport(savedOnline);
+        setHasUnsavedCloudChanges(false);
+        setLastSyncedAt(new Date().toISOString());
+        resetDirtyTracker();
+        setShareModalReportId(savedOnline.id);
+      } catch {
+        showToast('Save the report online before sharing');
+      } finally {
+        setIsSavingOnline(false);
+      }
+      return;
+    }
+    setShareModalReportId(existing.id);
+  };
+
+  const handleDuplicateCloudReport = async (reportId: string) => {
+    setBusyReportId(reportId);
+    try {
+      const loaded = await loadReportWithPhotosOnline(
+        effectiveUid,
+        reportId,
+        user?.email
+      );
+      if (!loaded) {
+        showToast('Report not found');
+        return;
+      }
+      const actorName =
+        user?.displayName || user?.email || loaded.report.meta.inspectedBy || 'Inspector';
+      const nextReportSequence = computeNextBranchReportSequence(
+        loaded.report.meta.storeLocation,
+        loaded.report.meta.dateOfInspection,
+        allKnownReportRecords
+      );
+      const duplicated = await duplicateReportOnline(
+        effectiveUid,
+        actorName,
+        loaded.report,
+        { nextReportSequence }
+      );
+      setCustomBranchForReportId(null);
+      setReport(duplicated);
+      setActiveCollaboration(null);
+      setHasUnsavedCloudChanges(false);
+      setLastSyncedAt(duplicated.updatedAt || new Date().toISOString());
+      setRemoteUpdateNotice(null);
+      resetDirtyTracker();
+      setViewMode('form');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      showToast('Duplicated into your online reports');
+    } catch {
+      showToast('Could not duplicate report');
+    } finally {
+      setBusyReportId(null);
+    }
+  };
+
+  const handleDuplicateCurrentReport = async () => {
+    setIsSavingOnline(true);
+    try {
+      const actorName =
+        user?.displayName || user?.email || report.meta.inspectedBy || 'Inspector';
+      const nextReportSequence = computeNextBranchReportSequence(
+        report.meta.storeLocation,
+        report.meta.dateOfInspection,
+        allKnownReportRecords
+      );
+      const duplicated = await duplicateReportOnline(
+        effectiveUid,
+        actorName,
+        report,
+        {
+          nextReportSequence,
+        }
+      );
+      setCustomBranchForReportId(null);
+      setReport(duplicated);
+      setActiveCollaboration(null);
+      setHasUnsavedCloudChanges(false);
+      setLastSyncedAt(duplicated.updatedAt || new Date().toISOString());
+      setRemoteUpdateNotice(null);
+      resetDirtyTracker();
+      setViewMode('form');
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+      showToast('Created an editable copy in your online reports');
+    } catch {
+      showToast('Could not duplicate report');
+    } finally {
+      setIsSavingOnline(false);
+    }
+  };
+
+  const handleLeaveSharedReport = async (reportId: string) => {
+    if (!user?.email) return;
+    setBusyReportId(reportId);
+    try {
+      await leaveSharedReportOnline(user.email, reportId);
+      if (report.id === reportId) {
+        setReport(createBlankInspection());
+        setActiveCollaboration(null);
+        setHasUnsavedCloudChanges(false);
+        setLastSyncedAt(null);
+        setRemoteUpdateNotice(null);
+        resetDirtyTracker();
+      }
+      showToast('Removed from Shared With Me');
+    } catch {
+      showToast('Could not leave shared report');
+    } finally {
+      setBusyReportId(null);
+    }
+  };
+
+  const handlePullLatestRemoteReport = async () => {
+    setBusyReportId(report.id);
+    try {
+      const fresh = await loadReportWithPhotosOnline(
+        effectiveUid,
+        report.id,
+        user?.email
+      );
+      if (fresh) {
+        setReport(fresh.report);
+        setActiveCollaboration(fresh.collaboration);
+        setHasUnsavedCloudChanges(false);
+        setLastSyncedAt(fresh.report.updatedAt || new Date().toISOString());
+        setRemoteUpdateNotice(null);
+        resetDirtyTracker();
+        showToast('Pulled latest version from cloud');
+      }
+    } catch {
+      showToast('Could not refresh latest version');
+    } finally {
+      setBusyReportId(null);
+    }
+  };
+
   const handleUploadLocalReportToCloud = async (entry: InspectionReport) => {
-    if (!user) return;
     setBusyReportId(entry.id);
     try {
-      await saveReportOnline(user.uid, entry);
-      showToast('Local report synced online');
+      const actorName =
+        user?.displayName || user?.email || entry.meta.inspectedBy || 'Inspector';
+      const { report: savedOnline, failedPhotoCount } = await saveReportOnline(
+        effectiveUid,
+        withResolvedSequence(entry),
+        {
+          actorName,
+          reportOwnerId: effectiveUid,
+          nextSyncVersion: 1,
+        }
+      );
+      await saveReportSnapshotToDb(savedOnline).catch(() => undefined);
+      setLocalReports((prev) => {
+        const filtered = prev.filter((r) => r.id !== savedOnline.id);
+        return [savedOnline, ...filtered];
+      });
+      if (reportRef.current.id === savedOnline.id) {
+        const syncedIso = new Date().toISOString();
+        setReport(savedOnline);
+        setHasUnsavedCloudChanges(failedPhotoCount > 0);
+        setLastSyncedAt(syncedIso);
+        resetDirtyTracker();
+        persistActiveSyncState({
+          reportId: savedOnline.id,
+          hasUnsavedCloudChanges: failedPhotoCount > 0,
+          lastSyncedAt: syncedIso,
+        });
+      }
+      showToast(
+        failedPhotoCount > 0
+          ? `Report synced online (${failedPhotoCount} ${
+              failedPhotoCount === 1 ? 'photo' : 'photos'
+            } failed)`
+          : 'Local report and photos synced online'
+      );
     } catch {
       showToast('Could not sync report online');
     } finally {
@@ -1261,22 +3212,34 @@ export default function App() {
   };
 
   const handleEditCloudReport = async (reportId: string) => {
-    if (!user) return;
     setBusyReportId(reportId);
     try {
-      const loaded = await loadReportWithPhotosOnline(user.uid, reportId);
+      const loaded = await loadReportWithPhotosOnline(
+        effectiveUid,
+        reportId,
+        user?.email
+      );
       if (!loaded) {
         showToast('Report not found');
         return;
       }
-      setReport(loaded);
+      setCustomBranchForReportId(null);
+      setReport(withResolvedSequence(loaded.report));
+      setActiveCollaboration(loaded.collaboration);
       setHasUnsavedCloudChanges(false);
+      setLastSyncedAt(loaded.report.updatedAt || new Date().toISOString());
+      setRemoteUpdateNotice(null);
+      resetDirtyTracker();
       setActiveSectionCode('ALL');
       setFilterMode('all');
       setSearchQuery('');
       setViewMode('form');
       window.scrollTo({ top: 0, behavior: 'smooth' });
-      showToast('Loaded online report for editing');
+      showToast(
+        loaded.collaboration.accessRole === 'viewer'
+          ? 'Opened shared report (View Only)'
+          : 'Loaded online report for editing'
+      );
     } catch {
       showToast('Could not load report');
     } finally {
@@ -1285,16 +3248,24 @@ export default function App() {
   };
 
   const handlePreviewCloudReport = async (reportId: string) => {
-    if (!user) return;
     setBusyReportId(reportId);
     try {
-      const loaded = await loadReportWithPhotosOnline(user.uid, reportId);
+      const loaded = await loadReportWithPhotosOnline(
+        effectiveUid,
+        reportId,
+        user?.email
+      );
       if (!loaded) {
         showToast('Report not found');
         return;
       }
-      setReport(loaded);
+      setCustomBranchForReportId(null);
+      setReport(withResolvedSequence(loaded.report));
+      setActiveCollaboration(loaded.collaboration);
       setHasUnsavedCloudChanges(false);
+      setLastSyncedAt(loaded.report.updatedAt || new Date().toISOString());
+      setRemoteUpdateNotice(null);
+      resetDirtyTracker();
       setViewMode('report');
       window.scrollTo({ top: 0, behavior: 'smooth' });
     } catch {
@@ -1305,15 +3276,18 @@ export default function App() {
   };
 
   const handleDownloadCloudReportPdf = async (reportId: string) => {
-    if (!user) return;
     setBusyReportId(reportId);
     try {
-      const loaded = await loadReportWithPhotosOnline(user.uid, reportId);
+      const loaded = await loadReportWithPhotosOnline(
+        effectiveUid,
+        reportId,
+        user?.email
+      );
       if (!loaded) {
         showToast('Report not found');
         return;
       }
-      await exportInspectionToPdf(loaded, exportOptions);
+      await exportInspectionToPdf(withResolvedSequence(loaded.report), exportOptions);
       showToast('PDF report downloaded');
     } catch {
       showToast('Could not download report PDF');
@@ -1323,15 +3297,18 @@ export default function App() {
   };
 
   const handleDownloadCloudReportExcel = async (reportId: string) => {
-    if (!user) return;
     setBusyReportId(reportId);
     try {
-      const loaded = await loadReportWithPhotosOnline(user.uid, reportId);
+      const loaded = await loadReportWithPhotosOnline(
+        effectiveUid,
+        reportId,
+        user?.email
+      );
       if (!loaded) {
         showToast('Report not found');
         return;
       }
-      await exportInspectionToExcel(loaded);
+      await exportInspectionToExcel(withResolvedSequence(loaded.report));
       showToast('Excel (.xlsx) report downloaded');
     } catch {
       showToast('Could not download Excel report');
@@ -1340,16 +3317,43 @@ export default function App() {
     }
   };
 
-  const handleEmailCloudReport = async (reportId: string) => {
-    if (!user) return;
+  const handleDownloadCloudReportDocx = async (reportId: string) => {
     setBusyReportId(reportId);
     try {
-      const loaded = await loadReportWithPhotosOnline(user.uid, reportId);
+      const loaded = await loadReportWithPhotosOnline(
+        effectiveUid,
+        reportId,
+        user?.email
+      );
       if (!loaded) {
         showToast('Report not found');
         return;
       }
-      setEmailReportTarget(loaded);
+      await exportInspectionToDocx(
+        withResolvedSequence(loaded.report),
+        exportOptions
+      );
+      showToast('Word (.docx) report downloaded');
+    } catch {
+      showToast('Could not download Word (.docx) report');
+    } finally {
+      setBusyReportId(null);
+    }
+  };
+
+  const handleEmailCloudReport = async (reportId: string) => {
+    setBusyReportId(reportId);
+    try {
+      const loaded = await loadReportWithPhotosOnline(
+        effectiveUid,
+        reportId,
+        user?.email
+      );
+      if (!loaded) {
+        showToast('Report not found');
+        return;
+      }
+      setEmailReportTarget(withResolvedSequence(loaded.report));
     } catch {
       showToast('Could not load report for emailing');
     } finally {
@@ -1358,16 +3362,20 @@ export default function App() {
   };
 
   const handleDeleteCloudReport = async (reportId: string) => {
-    if (!user) return;
     setBusyReportId(reportId);
     try {
-      await deleteReportOnline(user.uid, reportId);
+      await deleteReportOnline(effectiveUid, reportId);
       await deleteSavedReportFromDb(reportId);
+      fetchedPhotoCountsRef.current.delete(reportId);
       setLocalReports((prev) => prev.filter((r) => r.id !== reportId));
       setCloudPhotos((prev) => prev.filter((p) => p.reportId !== reportId));
       if (report.id === reportId) {
         setReport(createBlankInspection());
+        setActiveCollaboration(null);
         setHasUnsavedCloudChanges(false);
+        setLastSyncedAt(null);
+        setRemoteUpdateNotice(null);
+        resetDirtyTracker();
       }
       showToast('Online report deleted');
     } catch {
@@ -1381,9 +3389,99 @@ export default function App() {
     try {
       await deleteSavedReportFromDb(id);
       setLocalReports((prev) => prev.filter((r) => r.id !== id));
+      if (
+        report.id === id &&
+        !cloudReports.some((r) => r.id === id) &&
+        !sharedReports.some((r) => r.id === id)
+      ) {
+        setCustomBranchForReportId(null);
+        setReport(createBlankInspection());
+        setActiveCollaboration(null);
+        setHasUnsavedCloudChanges(false);
+        setLastSyncedAt(null);
+        setRemoteUpdateNotice(null);
+        resetDirtyTracker();
+      }
       showToast('Local snapshot removed');
     } catch {
       showToast('Could not delete snapshot');
+    }
+  };
+
+  const handleDiscardCurrentDraft = () => {
+    setCustomBranchForReportId(null);
+    setReport(createBlankInspection());
+    setActiveCollaboration(null);
+    setHasUnsavedCloudChanges(false);
+    setLastSyncedAt(null);
+    setRemoteUpdateNotice(null);
+    resetDirtyTracker();
+    showToast('Unsaved draft removed');
+  };
+
+  const handleExportMergedPdf = async (items: MergedReportSelectionItem[]) => {
+    if (items.length === 0 || isExportingMergedPdf) return;
+    setIsExportingMergedPdf(true);
+    setMergedPdfProgress({ current: 0, total: items.length });
+    try {
+      const resolvedReports: InspectionReport[] = [];
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        setMergedPdfProgress({ current: i + 1, total: items.length });
+
+        if (
+          item.id === report.id &&
+          hasUnsavedCloudChanges &&
+          activeCollaboration?.accessRole !== 'viewer'
+        ) {
+          resolvedReports.push(withResolvedSequence(report));
+          continue;
+        }
+
+        if (item.source === 'local') {
+          const localEntry = localReports.find((r) => r.id === item.id);
+          if (localEntry) {
+            resolvedReports.push(withResolvedSequence(localEntry));
+          }
+          continue;
+        }
+
+        const loaded = await loadReportWithPhotosOnline(
+          effectiveUid,
+          item.id,
+          user?.email
+        );
+        if (loaded) {
+          resolvedReports.push(withResolvedSequence(loaded.report));
+          continue;
+        }
+
+        const fallbackLocal = localReports.find((r) => r.id === item.id);
+        if (fallbackLocal) {
+          resolvedReports.push(withResolvedSequence(fallbackLocal));
+        }
+      }
+
+      if (resolvedReports.length === 0) {
+        showToast('No selected reports could be loaded for export');
+        return;
+      }
+
+      const result = await exportMergedReportsToPdf(
+        resolvedReports,
+        exportOptions,
+        (current, total) => setMergedPdfProgress({ current, total })
+      );
+      showToast(
+        `Exported merged PDF (${result.reportCount} ${
+          result.reportCount === 1 ? 'report' : 'reports'
+        }, ${result.pageCount} pages)`
+      );
+    } catch {
+      showToast('Could not export merged PDF');
+    } finally {
+      setIsExportingMergedPdf(false);
+      setMergedPdfProgress(null);
     }
   };
 
@@ -1440,25 +3538,105 @@ export default function App() {
     }
   };
 
-  const handleCreateBlank = () => {
+  const handleExportDocx = async () => {
+    setIsExportingDocx(true);
+    try {
+      await exportInspectionToDocx(report, exportOptions);
+      showToast('Word (.docx) report saved');
+    } catch {
+      showToast('Could not generate Word (.docx) file. Please try again.');
+    } finally {
+      setIsExportingDocx(false);
+    }
+  };
+
+  const handleDownloadBlankPdf = async () => {
+    try {
+      await exportBlankChecklistPdf();
+      showToast('Blank checklist PDF (sheet only) downloaded');
+    } catch {
+      showToast('Could not generate blank checklist PDF.');
+    }
+  };
+
+  const handleDownloadBlankExcel = async () => {
+    try {
+      await exportBlankChecklistExcel();
+      showToast('Blank checklist Excel (.xlsx) downloaded');
+    } catch {
+      showToast('Could not generate blank checklist Excel file.');
+    }
+  };
+
+  const handleDownloadBlankDocx = async () => {
+    try {
+      await exportBlankChecklistDocx();
+      showToast('Blank checklist Word (.docx) downloaded');
+    } catch {
+      showToast('Could not generate blank checklist Word (.docx) file.');
+    }
+  };
+
+  const handleCreateBlankForBranch = (branchName?: string) => {
     const fresh = createBlankInspection();
+    const cleanedBranch = branchName?.trim() || '';
     if (user?.displayName) {
       fresh.meta.inspectedBy = user.displayName;
       fresh.signOffs.performedBy.printedName = user.displayName;
     }
+    if (cleanedBranch) {
+      fresh.meta.storeLocation = cleanedBranch;
+      fresh.meta.reportSequence = computeNextBranchReportSequence(
+        cleanedBranch,
+        fresh.meta.dateOfInspection,
+        allKnownReportRecords,
+        fresh.id
+      );
+      setCustomBranchForReportId(isPresetBranch(cleanedBranch) ? null : fresh.id);
+    } else {
+      setCustomBranchForReportId(null);
+    }
     setReport(fresh);
-    setHasUnsavedCloudChanges(false);
+    setActiveCollaboration(null);
+    setHasUnsavedCloudChanges(Boolean(cleanedBranch));
+    setLastSyncedAt(null);
+    setRemoteUpdateNotice(null);
+    resetDirtyTracker();
+    if (cleanedBranch) {
+      dirtyFieldsRef.current.full = true;
+    }
     setActiveSectionCode('ALL');
     setFilterMode('all');
     setSearchQuery('');
     setViewMode('form');
     window.scrollTo({ top: 0, behavior: 'smooth' });
-    showToast('Created a new blank IQAF-005 report');
+    showToast(
+      cleanedBranch
+        ? `Started new IQAF-005 audit for ${cleanedBranch}`
+        : 'Created a new blank IQAF-005 report'
+    );
+  };
+
+  const handleCreateBlank = () => {
+    handleCreateBlankForBranch();
   };
 
   const handleLoadSample = () => {
-    setReport(createSampleInspection());
+    const sample = createSampleInspection();
+    sample.meta.reportSequence = computeNextBranchReportSequence(
+      sample.meta.storeLocation,
+      sample.meta.dateOfInspection,
+      allKnownReportRecords,
+      sample.id
+    );
+    setCustomBranchForReportId(null);
+    setReport(sample);
+    setActiveCollaboration(null);
     setHasUnsavedCloudChanges(true);
+    setLastSyncedAt(null);
+    setRemoteUpdateNotice(null);
+    resetDirtyTracker();
+    dirtyFieldsRef.current.full = true;
     setActiveSectionCode('ALL');
     setFilterMode('all');
     setSearchQuery('');
@@ -1572,10 +3750,20 @@ export default function App() {
   const activeSectionIdx = CHECKLIST_SECTIONS.findIndex(
     (s) => s.code === activeSectionCode
   );
+  const effectiveReportSequence =
+    report.meta.reportSequence ?? resolvedSequenceMap.get(report.id) ?? 1;
   const currentReportNo = formatReportNo(
     report.meta.storeLocation,
-    report.meta.dateOfInspection
+    report.meta.dateOfInspection,
+    effectiveReportSequence
   );
+  const normalizedStoreLocation = normalizeBranchName(report.meta.storeLocation);
+  const isCustomBranchActive =
+    customBranchForReportId === report.id ||
+    (normalizedStoreLocation !== '' && !isPresetBranch(report.meta.storeLocation));
+  const selectedBranchDropdownValue = isCustomBranchActive
+    ? CUSTOM_BRANCH_OPTION
+    : normalizedStoreLocation;
 
   const sidebarContent = (
     <div className="flex flex-col h-full bg-white">
@@ -1612,6 +3800,15 @@ export default function App() {
                   )}
                 </div>
               </div>
+              <button
+                type="button"
+                onClick={() => void handleSignOut()}
+                className="p-1.5 text-slate-400 hover:text-red-700 hover:bg-red-50 rounded-md transition-colors shrink-0"
+                title="Sign out of Google account"
+                aria-label="Sign out of Google account"
+              >
+                <LogOut className="w-3.5 h-3.5" />
+              </button>
             </div>
             <div className="grid grid-cols-2 gap-1.5">
               <button
@@ -1639,19 +3836,60 @@ export default function App() {
           </div>
         ) : (
           <div className="space-y-2">
-            <div className="text-xs font-medium text-slate-700">
-              Store reports &amp; photos online
+            <div className="min-w-0">
+              <div className="text-xs font-semibold text-slate-900 truncate flex items-center gap-1.5">
+                <Cloud className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                <span className="truncate">Public Cloud Connected</span>
+              </div>
+              <div className="text-[11px] text-slate-500 mt-0.5 tabular-nums">
+                {cloudReports.length} online{' '}
+                {cloudReports.length === 1 ? 'report' : 'reports'} ·{' '}
+                {isAutoSaving || isSavingOnline ? (
+                  <span className="text-amber-700 font-medium">
+                    Auto-saving…
+                  </span>
+                ) : hasUnsavedCloudChanges ? (
+                  <span className="text-amber-700 font-medium">Unsaved</span>
+                ) : (
+                  <span className="text-emerald-700 font-medium">
+                    {autoSaveEnabled ? 'Auto-saved' : 'Synced'}
+                  </span>
+                )}
+              </div>
+            </div>
+            <div className="grid grid-cols-2 gap-1.5">
+              <button
+                type="button"
+                onClick={handleSaveCurrentReport}
+                disabled={isSavingOnline}
+                className="inline-flex items-center justify-center gap-1 h-8 px-2 text-[11px] font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
+              >
+                {isSavingOnline ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Save className="w-3 h-3" />
+                )}
+                Save Online
+              </button>
+              <button
+                type="button"
+                onClick={handleCreateBlank}
+                className="inline-flex items-center justify-center gap-1 h-8 px-2 text-[11px] font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-100 rounded-md transition-colors whitespace-nowrap"
+              >
+                <FilePlus2 className="w-3 h-3" />
+                New Report
+              </button>
             </div>
             <button
               type="button"
               onClick={handleSignIn}
               disabled={isSigningIn}
-              className="w-full inline-flex items-center justify-center gap-1.5 h-8 px-3 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-60 rounded-md transition-colors"
+              className="w-full inline-flex items-center justify-center gap-1.5 h-7 px-2.5 text-[11px] font-medium text-slate-700 bg-white border border-slate-200 hover:bg-slate-100 disabled:opacity-60 rounded-md transition-colors"
             >
               {isSigningIn ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                <Loader2 className="w-3 h-3 animate-spin" />
               ) : (
-                <LogIn className="w-3.5 h-3.5" />
+                <LogIn className="w-3 h-3" />
               )}
               Sign in with Google
             </button>
@@ -1700,6 +3938,28 @@ export default function App() {
         <button
           type="button"
           onClick={() => {
+            setViewMode('dashboard');
+            setMobileNavOpen(false);
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }}
+          className={`w-full flex items-center justify-between px-2.5 py-2 rounded-md text-xs font-medium transition-colors ${
+            viewMode === 'dashboard'
+              ? 'bg-slate-900 text-white'
+              : 'text-slate-700 hover:bg-slate-100'
+          }`}
+        >
+          <span className="inline-flex items-center gap-1.5">
+            <LayoutDashboard className="w-3.5 h-3.5" />
+            Branch Dashboard
+          </span>
+          <span className="font-mono tabular-nums text-[11px] opacity-85">
+            Rankings
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => {
             setViewMode('reports');
             setMobileNavOpen(false);
             window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -1715,7 +3975,7 @@ export default function App() {
             All Reports
           </span>
           <span className="font-mono tabular-nums text-[11px] opacity-85">
-            {user ? cloudReports.length : localReports.length}
+            {cloudReports.length + sharedReports.length}
           </span>
         </button>
 
@@ -1729,7 +3989,7 @@ export default function App() {
           }`}
         >
           <span>Checklist Form (A–Q)</span>
-          <span className="font-mono tabular-nums opacity-80">67</span>
+          <span className="font-mono tabular-nums opacity-80">{TOTAL_ITEMS_COUNT}</span>
         </button>
 
         <button
@@ -1786,24 +4046,68 @@ export default function App() {
           const stat = metrics.bySection[section.code];
           const isActive =
             viewMode === 'form' && activeSectionCode === section.code;
-          const isComplete = stat.answered === stat.total;
+          const isComplete = stat.total > 0 && stat.answered === stat.total;
+          const completionPct =
+            stat.total > 0 ? Math.round((stat.answered / stat.total) * 100) : 0;
+          const ringRadius = 6;
+          const ringCircumference = 2 * Math.PI * ringRadius;
+          const ringDashOffset =
+            ringCircumference - (completionPct / 100) * ringCircumference;
+          const ringStrokeClass = isComplete
+            ? stat.no > 0
+              ? 'stroke-amber-600'
+              : 'stroke-emerald-600'
+            : completionPct > 0
+              ? isActive
+                ? 'stroke-red-700'
+                : 'stroke-slate-700'
+              : 'stroke-transparent';
 
           return (
             <button
               key={section.code}
               type="button"
               onClick={() => handleJumpToSection(section.code)}
+              title={`${section.code}. ${section.title} — ${stat.answered}/${stat.total} completed (${completionPct}%)${stat.no > 0 ? `, ${stat.no} non-compliant` : ''}`}
+              aria-label={`${section.code}. ${section.title}, ${completionPct}% complete (${stat.answered} of ${stat.total} items)`}
               className={`w-full flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-md text-xs transition-colors text-left ${
                 isActive
                   ? 'bg-red-50 text-red-900 font-semibold'
                   : 'text-slate-700 hover:bg-slate-100'
               }`}
             >
-              <span className="truncate">
-                <span className="font-mono font-semibold mr-1.5">
-                  {section.code}.
+              <span className="flex items-center gap-2 min-w-0">
+                <svg
+                  className="w-4 h-4 shrink-0 -rotate-90"
+                  viewBox="0 0 16 16"
+                  aria-hidden="true"
+                >
+                  <circle
+                    cx="8"
+                    cy="8"
+                    r={ringRadius}
+                    fill="none"
+                    strokeWidth="2"
+                    className={isActive ? 'stroke-red-200' : 'stroke-slate-200'}
+                  />
+                  <circle
+                    cx="8"
+                    cy="8"
+                    r={ringRadius}
+                    fill="none"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeDasharray={ringCircumference}
+                    strokeDashoffset={ringDashOffset}
+                    className={`transition-all duration-300 ${ringStrokeClass}`}
+                  />
+                </svg>
+                <span className="truncate">
+                  <span className="font-mono font-semibold mr-1">
+                    {section.code}.
+                  </span>
+                  {section.title}
                 </span>
-                {section.title}
               </span>
               <span className="flex items-center gap-1.5 font-mono text-[11px] tabular-nums shrink-0">
                 {stat.no > 0 && (
@@ -1812,11 +4116,15 @@ export default function App() {
                 <span
                   className={
                     isComplete
-                      ? 'text-emerald-700 font-medium'
-                      : 'text-slate-400'
+                      ? 'text-emerald-700 font-semibold'
+                      : completionPct > 0
+                        ? isActive
+                          ? 'text-red-800 font-medium'
+                          : 'text-slate-600 font-medium'
+                        : 'text-slate-400'
                   }
                 >
-                  {stat.answered}/{stat.total}
+                  {completionPct}%
                 </span>
               </span>
             </button>
@@ -1852,12 +4160,83 @@ export default function App() {
     </div>
   );
 
+  const bottomRightToastStack =
+    isNetworkOffline || toastMessage ? (
+      <div className="no-print fixed bottom-5 right-5 z-50 flex flex-col items-end gap-2 max-w-[calc(100vw-2.5rem)] pointer-events-none">
+        {toastMessage && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-auto bg-slate-900 text-white text-xs font-medium px-4 py-2.5 rounded-lg shadow-lg"
+          >
+            {toastMessage}
+          </div>
+        )}
+        {isNetworkOffline && (
+          <div
+            role="status"
+            aria-live="polite"
+            className="pointer-events-auto flex items-start gap-2.5 bg-slate-900 text-white border border-amber-500/40 px-3.5 py-2.5 rounded-lg shadow-lg max-w-xs sm:max-w-sm"
+          >
+            <WifiOff className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="min-w-0">
+              <div className="text-xs font-semibold text-white leading-tight">
+                Network connection lost
+              </div>
+              <div className="text-[11px] text-slate-300 mt-0.5 leading-snug">
+                Working offline — edits stay saved locally and will sync once
+                reconnected.
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    ) : null;
+
+  if (!authReady) {
+    return (
+      <>
+        {isRunningFromOfflineCache && (
+          <header className="no-print sticky top-0 z-40">
+            <OfflineShellHeaderBanner
+              isNetworkOffline={isNetworkOffline}
+              updateAvailable={appShellSnapshot.updateAvailable}
+              isChecking={isCheckingAppUpdates}
+              statusNote={shellUpdateNote}
+              onCheckForUpdates={() => void handleCheckForAppUpdates()}
+            />
+          </header>
+        )}
+        <AuthGateScreen
+          mode="loading"
+          isSigningIn={false}
+          errorMessage={authError}
+          hasPendingShareLink={Boolean(
+            pendingShareLinkToken || pendingDirectReportId
+          )}
+          onSignIn={handleSignIn}
+        />
+        {bottomRightToastStack}
+      </>
+    );
+  }
+
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
+    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900 print-reset-layout">
       {/* =================================================================== */}
-      {/* TOP NAVIGATION BAR (Strict 3-Zone Contract)                         */}
+      {/* TOP NAVIGATION BAR (Strict 3-Zone Contract + Offline Cache Banner)  */}
       {/* =================================================================== */}
-      <header className="no-print sticky top-0 z-30 h-14 bg-white border-b border-slate-200 px-4 lg:px-6 flex items-center justify-between gap-8">
+      <header className="no-print sticky top-0 z-30 bg-white border-b border-slate-200">
+        {isRunningFromOfflineCache && (
+          <OfflineShellHeaderBanner
+            isNetworkOffline={isNetworkOffline}
+            updateAvailable={appShellSnapshot.updateAvailable}
+            isChecking={isCheckingAppUpdates}
+            statusNote={shellUpdateNote}
+            onCheckForUpdates={() => void handleCheckForAppUpdates()}
+          />
+        )}
+        <div className="h-14 px-4 lg:px-6 flex items-center justify-between gap-8">
         {/* Zone 1: Single-line Brand Wordmark */}
         <div className="flex items-center gap-2.5 shrink-0">
           <button
@@ -1881,8 +4260,22 @@ export default function App() {
           </a>
         </div>
 
-        {/* Zone 2: 5 Clean Single-Line Nav Links */}
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-600">
+        {/* Zone 2: Clean Single-Line Nav Links */}
+        <nav className="hidden md:flex items-center gap-5 text-sm font-medium text-slate-600">
+          <button
+            type="button"
+            onClick={() => {
+              setViewMode('dashboard');
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+            className={`py-1 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
+              viewMode === 'dashboard'
+                ? 'border-red-700 text-slate-950 font-semibold'
+                : 'border-transparent hover:text-slate-900'
+            }`}
+          >
+            Dashboard
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -1955,33 +4348,34 @@ export default function App() {
         {/* Zone 3: Real-Time Network/Sync Status & Primary Action */}
         <div className="flex items-center gap-2.5 shrink-0">
           <NetworkStatusIndicator
-            isSignedIn={Boolean(user)}
+            isSignedIn={true}
             isSigningIn={isSigningIn}
             isSavingOnline={isSavingOnline || isAutoSaving}
             hasUnsavedCloudChanges={hasUnsavedCloudChanges}
+            lastSaveError={lastCloudSaveError}
             uploadingPhotoCount={photoSyncCounts.uploading}
             failedPhotoCount={photoSyncCounts.failed}
             localOnlyPhotoCount={photoSyncCounts.localOnly}
+            queuedOtherReportsPhotoCount={otherReportsPendingPhotoCount}
             totalPhotosCount={indexedPhotos.length}
             lastSyncedAt={lastSyncedAt}
             autoSaveEnabled={autoSaveEnabled}
             onToggleAutoSave={handleToggleAutoSave}
+            hdUploadsEnabled={hdUploadsEnabled}
+            onToggleHdUploads={handleToggleHdUploads}
+            backgroundSync={backgroundSyncState}
             onSaveOnline={handleSaveCurrentReport}
             onRetryFailedPhotos={retryAllFailedPhotos}
             onSignIn={handleSignIn}
             onConnectivityChange={(online) => {
+              setIsNetworkOffline(!online);
               if (online) {
+                setShellUpdateNote(null);
                 showToast('Connection restored — syncing online');
-                if (user) {
-                  syncPendingOrFailedPhotos(user, true);
-                  if (autoSaveEnabled && hasUnsavedCloudChanges) {
-                    void runCloudAutosave(user);
-                  }
+                void backgroundSyncServiceRef.current?.triggerSync('online');
+                if (autoSaveEnabled && hasUnsavedCloudChanges) {
+                  void runCloudAutosave(user);
                 }
-              } else {
-                showToast(
-                  'You are offline — edits and photos remain saved locally'
-                );
               }
             }}
           />
@@ -1998,6 +4392,7 @@ export default function App() {
             )}
             <span>{isExporting ? 'Exporting…' : 'Export PDF'}</span>
           </button>
+        </div>
         </div>
       </header>
 
@@ -2058,7 +4453,7 @@ export default function App() {
       {/* =================================================================== */}
       {/* MAIN WORKSPACE BODY                                                 */}
       {/* =================================================================== */}
-      <div className="flex-1 flex min-h-0">
+      <div className="flex-1 flex min-h-0 print-reset-layout">
         {/* Desktop Sidebar */}
         <aside className="no-print hidden lg:block w-[264px] shrink-0 border-r border-slate-200 bg-white sticky top-14 h-[calc(100vh-3.5rem)]">
           {sidebarContent}
@@ -2080,41 +4475,150 @@ export default function App() {
             </div>
           )}
 
-          {viewMode === 'reports' ? (
-            <ReportsLibraryView
-              user={user}
-              authReady={authReady}
-              onSignIn={handleSignIn}
-              onSignOut={handleSignOut}
-              isSigningIn={isSigningIn}
+          {/* Incoming share link sign-in prompt when recipient is signed out */}
+          {authReady &&
+            !user &&
+            (pendingShareLinkToken || pendingDirectReportId) && (
+              <div className="no-print bg-slate-900 text-white px-6 py-3 flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-2 text-xs">
+                  <Link2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span>
+                    Someone shared an IQAF-005 Store Inspection Report with you.
+                    Sign in with Google to open it.
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleSignIn}
+                    disabled={isSigningIn}
+                    className="inline-flex items-center gap-1.5 px-3.5 h-8 text-xs font-semibold text-slate-950 bg-white hover:bg-slate-100 rounded-md transition-colors whitespace-nowrap"
+                  >
+                    {isSigningIn ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <LogIn className="w-3.5 h-3.5" />
+                    )}
+                    Sign in with Google
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPendingShareLinkToken(null);
+                      setPendingDirectReportId(null);
+                      clearUrlShareParams();
+                    }}
+                    className="p-1 text-slate-400 hover:text-white"
+                    aria-label="Dismiss share link prompt"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            )}
+
+          {isClaimingShareLink && (
+            <div className="no-print bg-slate-100 border-b border-slate-200 px-6 py-2.5 text-xs text-slate-700 flex items-center gap-2">
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-500" />
+              <span>Opening shared inspection report…</span>
+            </div>
+          )}
+
+          {/* Read-only shared report banner */}
+          {activeCollaboration && activeCollaboration.accessRole === 'viewer' && (
+            <div className="no-print bg-slate-100 border-b border-slate-200 px-6 py-2.5 text-xs text-slate-800 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <Eye className="w-4 h-4 text-slate-600 shrink-0" />
+                <span>
+                  Shared by <strong>{activeCollaboration.ownerName}</strong> ·{' '}
+                  <strong>View Only</strong> — you can inspect, preview, and
+                  export PDF/Excel, or duplicate to make edits.
+                </span>
+              </div>
+              <button
+                type="button"
+                disabled={isSavingOnline}
+                onClick={handleDuplicateCurrentReport}
+                className="inline-flex items-center gap-1.5 px-3 h-7 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
+              >
+                <CopyPlus className="w-3.5 h-3.5" />
+                Duplicate to Edit
+              </button>
+            </div>
+          )}
+
+          {/* Live sync conflict banner when a collaborator saved a newer version */}
+          {remoteUpdateNotice && (
+            <div className="no-print bg-amber-50 border-b border-amber-200 px-6 py-2.5 text-xs text-amber-950 flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2">
+                <RefreshCw className="w-4 h-4 text-amber-700 shrink-0" />
+                <span>
+                  <strong>{remoteUpdateNotice.editorName}</strong> saved a newer
+                  version (v{remoteUpdateNotice.version}) while you had unsaved
+                  edits.
+                </span>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handlePullLatestRemoteReport}
+                  className="px-3 h-7 text-xs font-semibold text-white bg-amber-700 hover:bg-amber-800 rounded-md transition-colors whitespace-nowrap"
+                >
+                  Pull Latest
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRemoteUpdateNotice(null)}
+                  className="px-2.5 h-7 text-xs font-medium text-amber-900 bg-white border border-amber-300 hover:bg-amber-100 rounded-md transition-colors whitespace-nowrap"
+                >
+                  Keep My Edits
+                </button>
+              </div>
+            </div>
+          )}
+
+          {viewMode === 'dashboard' ? (
+            <BranchDashboardView
               currentReport={report}
-              hasUnsavedCloudChanges={hasUnsavedCloudChanges}
-              isSavingOnline={isSavingOnline}
               cloudReports={cloudReports}
-              loadingCloudReports={loadingCloudReports}
+              sharedReports={sharedReports}
               localReports={localReports}
+              loadingCloudReports={loadingCloudReports}
               busyReportId={busyReportId}
-              onCreateNewReport={handleCreateBlank}
+              onStartAuditForBranch={handleCreateBlankForBranch}
               onLoadSampleReport={handleLoadSample}
-              onSaveCurrentReport={handleSaveCurrentReport}
+              onOpenReportsLibrary={() => {
+                setViewMode('reports');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              onOpenCurrentReport={() => {
+                setViewMode('form');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
               onEditCloudReport={handleEditCloudReport}
               onPreviewCloudReport={handlePreviewCloudReport}
               onDownloadCloudReportPdf={handleDownloadCloudReportPdf}
               onDownloadCloudReportExcel={handleDownloadCloudReportExcel}
-              onEmailCloudReport={handleEmailCloudReport}
+              onDownloadCloudReportDocx={handleDownloadCloudReportDocx}
               onDeleteCloudReport={handleDeleteCloudReport}
+              onLeaveSharedReport={handleLeaveSharedReport}
               onEditLocalReport={(entry) => {
-                setReport(entry);
+                setCustomBranchForReportId(null);
+                setReport(withResolvedSequence(entry));
+                setActiveCollaboration(null);
                 setHasUnsavedCloudChanges(true);
+                setLastSyncedAt(null);
+                setRemoteUpdateNotice(null);
+                resetDirtyTracker();
+                dirtyFieldsRef.current.full = true;
                 setViewMode('form');
                 window.scrollTo({ top: 0, behavior: 'smooth' });
                 showToast('Loaded local snapshot for editing');
               }}
-              onUploadLocalReportToCloud={handleUploadLocalReportToCloud}
               onDownloadLocalReportPdf={async (entry) => {
                 setIsExporting(true);
                 try {
-                  await exportInspectionToPdf(entry, exportOptions);
+                  await exportInspectionToPdf(withResolvedSequence(entry), exportOptions);
                   showToast('PDF downloaded');
                 } finally {
                   setIsExporting(false);
@@ -2123,22 +4627,141 @@ export default function App() {
               onDownloadLocalReportExcel={async (entry) => {
                 setIsExportingExcel(true);
                 try {
-                  await exportInspectionToExcel(entry);
+                  await exportInspectionToExcel(withResolvedSequence(entry));
                   showToast('Excel (.xlsx) report downloaded');
                 } finally {
                   setIsExportingExcel(false);
                 }
               }}
-              onEmailLocalReport={(entry) => setEmailReportTarget(entry)}
+              onDownloadLocalReportDocx={async (entry) => {
+                setIsExportingDocx(true);
+                try {
+                  await exportInspectionToDocx(
+                    withResolvedSequence(entry),
+                    exportOptions
+                  );
+                  showToast('Word (.docx) report downloaded');
+                } finally {
+                  setIsExportingDocx(false);
+                }
+              }}
+              onDeleteLocalReport={handleDeleteLocalReport}
+              onDiscardCurrentDraft={handleDiscardCurrentDraft}
+            />
+          ) : viewMode === 'reports' ? (
+            <ReportsLibraryView
+              user={user}
+              authReady={authReady}
+              onSignIn={handleSignIn}
+              onSignOut={handleSignOut}
+              isSigningIn={isSigningIn}
+              currentReport={report}
+              activeCollaboration={activeCollaboration}
+              hasUnsavedCloudChanges={hasUnsavedCloudChanges}
+              isSavingOnline={isSavingOnline}
+              cloudReports={cloudReports}
+              sharedReports={sharedReports}
+              loadingCloudReports={loadingCloudReports}
+              localReports={localReports}
+              busyReportId={busyReportId}
+              isExportingMergedPdf={isExportingMergedPdf}
+              mergedPdfProgress={mergedPdfProgress}
+              exportOptions={exportOptions}
+              onChangeExportOptions={setExportOptions}
+              onCreateNewReport={handleCreateBlank}
+              onLoadSampleReport={handleLoadSample}
+              onDownloadBlankPdf={handleDownloadBlankPdf}
+              onDownloadBlankExcel={handleDownloadBlankExcel}
+              onDownloadBlankDocx={handleDownloadBlankDocx}
+              onSaveCurrentReport={handleSaveCurrentReport}
+              onShareCloudReport={(summary) => setShareModalReportId(summary.id)}
+              onDuplicateCloudReport={handleDuplicateCloudReport}
+              onLeaveSharedReport={handleLeaveSharedReport}
+              onEditCloudReport={handleEditCloudReport}
+              onPreviewCloudReport={handlePreviewCloudReport}
+              onDownloadCloudReportPdf={handleDownloadCloudReportPdf}
+              onDownloadCloudReportExcel={handleDownloadCloudReportExcel}
+              onDownloadCloudReportDocx={handleDownloadCloudReportDocx}
+              onEmailCloudReport={handleEmailCloudReport}
+              onDeleteCloudReport={handleDeleteCloudReport}
+              onExportMergedPdf={handleExportMergedPdf}
+              onEditLocalReport={(entry) => {
+                setCustomBranchForReportId(null);
+                setReport(withResolvedSequence(entry));
+                setActiveCollaboration(null);
+                setHasUnsavedCloudChanges(true);
+                setLastSyncedAt(null);
+                setRemoteUpdateNotice(null);
+                resetDirtyTracker();
+                dirtyFieldsRef.current.full = true;
+                setViewMode('form');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+                showToast('Loaded local snapshot for editing');
+              }}
+              onUploadLocalReportToCloud={handleUploadLocalReportToCloud}
+              onDownloadLocalReportPdf={async (entry) => {
+                setIsExporting(true);
+                try {
+                  await exportInspectionToPdf(withResolvedSequence(entry), exportOptions);
+                  showToast('PDF downloaded');
+                } finally {
+                  setIsExporting(false);
+                }
+              }}
+              onDownloadLocalReportExcel={async (entry) => {
+                setIsExportingExcel(true);
+                try {
+                  await exportInspectionToExcel(withResolvedSequence(entry));
+                  showToast('Excel (.xlsx) report downloaded');
+                } finally {
+                  setIsExportingExcel(false);
+                }
+              }}
+              onDownloadLocalReportDocx={async (entry) => {
+                setIsExportingDocx(true);
+                try {
+                  await exportInspectionToDocx(
+                    withResolvedSequence(entry),
+                    exportOptions
+                  );
+                  showToast('Word (.docx) report downloaded');
+                } finally {
+                  setIsExportingDocx(false);
+                }
+              }}
+              onEmailLocalReport={(entry) =>
+                setEmailReportTarget(withResolvedSequence(entry))
+              }
               onDeleteLocalReport={handleDeleteLocalReport}
             />
           ) : viewMode === 'summary' ? (
             <InspectionSummaryView
               report={report}
               totalStoredPhotosCount={totalUniqueStoredPhotos}
+              readOnly={isReadOnlyViewer}
+              hasUnsavedCloudChanges={hasUnsavedCloudChanges}
+              isNetworkOffline={isNetworkOffline}
+              isSavingOnline={isSavingOnline || isAutoSaving}
+              pendingPhotoSyncCount={
+                photoSyncCounts.localOnly + photoSyncCounts.failed
+              }
+              lastSyncedAt={lastSyncedAt}
+              onSaveOnline={handleSaveCurrentReport}
               onJumpToSection={handleJumpToSection}
               onJumpToItem={handleJumpToItem}
-              onJumpToSignOff={() => handleJumpToSection('SIGNOFF')}
+              onUpdateSignOff={(
+                slot: SignOffRoleKey,
+                next: SignOffEntry
+              ) =>
+                mutateReport(
+                  (prev) => ({
+                    ...prev,
+                    updatedAt: new Date().toISOString(),
+                    signOffs: { ...prev.signOffs, [slot]: next },
+                  }),
+                  { signOffKey: slot }
+                )
+              }
               onOpenReportPreview={() => {
                 setViewMode('report');
                 window.scrollTo({ top: 0, behavior: 'smooth' });
@@ -2149,9 +4772,11 @@ export default function App() {
               }}
               onExportPdf={handleExportPdf}
               onExportExcel={handleExportExcel}
+              onExportDocx={handleExportDocx}
               onEmailReport={() => setEmailReportTarget(report)}
               isExporting={isExporting}
               isExportingExcel={isExportingExcel}
+              isExportingDocx={isExportingDocx}
               onInspectPhoto={(itemNumber, itemText, photo) =>
                 setLightboxState({
                   kind: 'current',
@@ -2165,11 +4790,15 @@ export default function App() {
             <PhotoVaultView
               report={report}
               storedPhotos={combinedStoredPhotos}
+              hdUploadsEnabled={hdUploadsEnabled}
+              onToggleHdUploads={handleToggleHdUploads}
               onOpenCameraForItem={openCameraForItem}
               onAttachPhotosToItem={attachPhotosToItem}
               onRetryPhotoUpload={retryPhotoUpload}
               onUpdateCurrentPhotoCaption={updatePhotoCaption}
               onDeleteStoredPhoto={deleteStoredPhotoRecord}
+              onBulkDeleteStoredPhotos={bulkDeleteStoredPhotos}
+              onBulkRecaptionStoredPhotos={bulkRecaptionStoredPhotos}
               onInspectStoredPhoto={(record) =>
                 setLightboxState({ kind: 'stored', record })
               }
@@ -2182,9 +4811,14 @@ export default function App() {
               onChangeExportOptions={setExportOptions}
               onExportPdf={handleExportPdf}
               onExportExcel={handleExportExcel}
+              onExportDocx={handleExportDocx}
+              onDownloadBlankPdf={handleDownloadBlankPdf}
+              onDownloadBlankExcel={handleDownloadBlankExcel}
+              onDownloadBlankDocx={handleDownloadBlankDocx}
               onEmailReport={() => setEmailReportTarget(report)}
               isExporting={isExporting}
               isExportingExcel={isExportingExcel}
+              isExportingDocx={isExportingDocx}
               onBackToForm={() => setViewMode('form')}
               onInspectPhoto={(itemNumber, itemText, photo) =>
                 setLightboxState({
@@ -2198,7 +4832,7 @@ export default function App() {
           ) : (
             <div className="max-w-[1060px] mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
               {/* Inspection Header & Metadata Form Card */}
-              <section className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+              <section className="bg-white border border-slate-200 rounded-xl">
                 <div className="px-5 py-4 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                   <div className="flex items-center gap-4">
                     <JiangNanLogo />
@@ -2208,7 +4842,7 @@ export default function App() {
                       </h1>
                       <div className="text-xs text-slate-500 mt-0.5 font-mono tabular-nums">
                         Basis: {report.meta.documentationNo} (Rev.{' '}
-                        {report.meta.revisionNo}) · 67 Compliance Items
+                        {report.meta.revisionNo}) · {TOTAL_ITEMS_COUNT} Compliance Items
                       </div>
                       <div className="text-xs font-mono font-semibold text-slate-800 mt-0.5 tabular-nums">
                         Report No.: {currentReportNo}
@@ -2216,24 +4850,90 @@ export default function App() {
                     </div>
                   </div>
 
-                  <div className="flex flex-wrap items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      onClick={handleSaveCurrentReport}
-                      disabled={isSavingOnline}
-                      className="inline-flex items-center gap-1.5 px-3.5 h-8 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
-                    >
-                      {isSavingOnline ? (
-                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <Save className="w-3.5 h-3.5" />
-                      )}
-                      {isSavingOnline
-                        ? 'Saving…'
-                        : user
-                          ? 'Save Online'
-                          : 'Save Report'}
-                    </button>
+                  <div className="flex flex-col sm:items-end gap-2 shrink-0">
+                    {(() => {
+                      const updatedMs = report.updatedAt
+                        ? Date.parse(report.updatedAt)
+                        : NaN;
+                      const syncedMs = lastSyncedAt
+                        ? Date.parse(lastSyncedAt)
+                        : NaN;
+                      const useSyncedTs =
+                        !hasUnsavedCloudChanges &&
+                        Number.isFinite(syncedMs) &&
+                        (!Number.isFinite(updatedMs) || syncedMs >= updatedMs);
+                      const effectiveIso = useSyncedTs
+                        ? lastSyncedAt
+                        : report.updatedAt || lastSyncedAt;
+                      const relText = formatRelativeTime(
+                        effectiveIso,
+                        relativeNowMs
+                      );
+                      const isSyncedState =
+                        !hasUnsavedCloudChanges &&
+                        !isNetworkOffline;
+                      const fullClock =
+                        effectiveIso && Number.isFinite(Date.parse(effectiveIso))
+                          ? new Date(effectiveIso).toLocaleString()
+                          : '';
+                      return (
+                        <div
+                          title={
+                            fullClock
+                              ? `Last modified: ${fullClock} (${isSyncedState ? 'Synced to cloud' : 'Saved locally'})`
+                              : 'Last modified timestamp'
+                          }
+                          className="inline-flex items-center gap-1.5 text-[11px] text-slate-500 tabular-nums self-start sm:self-end"
+                        >
+                          <Clock className="w-3 h-3 text-slate-400 shrink-0" />
+                          <span>
+                            Last modified{' '}
+                            <span className="font-medium text-slate-700">
+                              {relText}
+                            </span>
+                          </span>
+                          <span aria-hidden="true" className="text-slate-300">
+                            ·
+                          </span>
+                          <span
+                            className={
+                              isSyncedState
+                                ? 'text-emerald-700 font-medium'
+                                : 'text-amber-700 font-medium'
+                            }
+                          >
+                            {isSyncedState ? 'Synced to cloud' : 'Saved locally'}
+                          </span>
+                        </div>
+                      );
+                    })()}
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
+                    {!isReadOnlyViewer && (
+                      <button
+                        type="button"
+                        onClick={handleSaveCurrentReport}
+                        disabled={isSavingOnline}
+                        className="inline-flex items-center gap-1.5 px-3.5 h-8 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
+                      >
+                        {isSavingOnline ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Save className="w-3.5 h-3.5" />
+                        )}
+                        {isSavingOnline ? 'Saving…' : 'Save Online'}
+                      </button>
+                    )}
+                    {user && (!activeCollaboration || activeCollaboration.accessRole === 'owner') && (
+                      <button
+                        type="button"
+                        onClick={handleShareCurrentReport}
+                        disabled={isSavingOnline}
+                        className="inline-flex items-center gap-1.5 px-3 h-8 text-xs font-semibold text-slate-800 bg-white border border-slate-300 hover:bg-slate-50 disabled:opacity-60 rounded-md transition-colors whitespace-nowrap"
+                      >
+                        <Share2 className="w-3.5 h-3.5 text-slate-600" />
+                        Share
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={handleCreateBlank}
@@ -2250,12 +4950,19 @@ export default function App() {
                       <Sparkles className="w-3.5 h-3.5 text-slate-500" />
                       Sample
                     </button>
+                    <BlankSheetMenuButton
+                      size="sm"
+                      onDownloadBlankPdf={handleDownloadBlankPdf}
+                      onDownloadBlankExcel={handleDownloadBlankExcel}
+                      onDownloadBlankDocx={handleDownloadBlankDocx}
+                    />
+                    </div>
                   </div>
                 </div>
 
                 {/* Metadata Inputs matching PDF Header Table */}
-                <div className="p-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-                  <label className="block">
+                <div className="p-5 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-4">
+                  <label className="block lg:col-span-2">
                     <span className="block text-xs font-semibold text-slate-700 mb-1.5">
                       Date of Inspection
                     </span>
@@ -2269,37 +4976,56 @@ export default function App() {
                     />
                   </label>
 
-                  <label className="block sm:col-span-2 lg:col-span-1">
-                    <span className="block text-xs font-semibold text-slate-700 mb-1.5">
-                      Store Location
-                    </span>
-                    <input
-                      type="text"
-                      maxLength={200}
-                      value={report.meta.storeLocation}
-                      onChange={(e) =>
-                        updateMeta('storeLocation', e.target.value)
-                      }
-                      placeholder="e.g., BGC High Street South"
-                      className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700"
-                    />
-                  </label>
+                  <div className="block lg:col-span-2">
+                    <label className="block">
+                      <span className="block text-xs font-semibold text-slate-700 mb-1.5">
+                        Store Location / Branch
+                      </span>
+                      <select
+                        value={selectedBranchDropdownValue}
+                        disabled={isReadOnlyViewer}
+                        onChange={(e) => handleSelectBranch(e.target.value)}
+                        className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 disabled:bg-slate-50 disabled:text-slate-500 focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700"
+                      >
+                        <option value="">Select branch…</option>
+                        <optgroup label="Store Branches">
+                          {STORE_BRANCHES.map((branch) => (
+                            <option key={branch} value={branch}>
+                              {branch}
+                            </option>
+                          ))}
+                        </optgroup>
+                        <optgroup label="Corporate &amp; Support">
+                          {FACILITY_BRANCHES.map((facility) => (
+                            <option key={facility} value={facility}>
+                              {facility}
+                            </option>
+                          ))}
+                        </optgroup>
+                        <optgroup label="Other">
+                          <option value={CUSTOM_BRANCH_OPTION}>Custom…</option>
+                        </optgroup>
+                      </select>
+                    </label>
+                    {isCustomBranchActive && (
+                      <input
+                        type="text"
+                        maxLength={200}
+                        disabled={isReadOnlyViewer}
+                        value={report.meta.storeLocation}
+                        onChange={(e) => handleCustomBranchChange(e.target.value)}
+                        placeholder="Enter custom branch name"
+                        className="mt-2 w-full h-9 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 placeholder:text-slate-400 disabled:bg-slate-50 disabled:text-slate-500 focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700"
+                      />
+                    )}
+                    <div className="mt-1 text-[11px] font-mono text-slate-500 tabular-nums truncate">
+                      {normalizedStoreLocation
+                        ? `Auto #${String(effectiveReportSequence).padStart(3, '0')} · ${currentReportNo}`
+                        : 'Select a branch to auto-number'}
+                    </div>
+                  </div>
 
-                  <label className="block">
-                    <span className="block text-xs font-semibold text-slate-700 mb-1.5">
-                      Time of Inspection
-                    </span>
-                    <input
-                      type="time"
-                      value={report.meta.timeOfInspection}
-                      onChange={(e) =>
-                        updateMeta('timeOfInspection', e.target.value)
-                      }
-                      className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 tabular-nums focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700"
-                    />
-                  </label>
-
-                  <label className="block">
+                  <label className="block lg:col-span-2">
                     <span className="block text-xs font-semibold text-slate-700 mb-1.5">
                       Inspected By
                     </span>
@@ -2314,9 +5040,71 @@ export default function App() {
                       className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700"
                     />
                   </label>
+
+                  <label className="block lg:col-span-3">
+                    <span className="block text-xs font-semibold text-slate-700 mb-1.5">
+                      Time of Inspection (Started)
+                    </span>
+                    <input
+                      type="time"
+                      value={report.meta.timeOfInspection}
+                      onChange={(e) =>
+                        updateMeta('timeOfInspection', e.target.value)
+                      }
+                      className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 tabular-nums focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700"
+                    />
+                  </label>
+
+                  <div className="block lg:col-span-3">
+                    <div className="flex items-center justify-between gap-2 mb-1.5">
+                      <label
+                        htmlFor="time-inspection-ended"
+                        className="text-xs font-semibold text-slate-700"
+                      >
+                        Time Inspection Ended (Optional)
+                      </label>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={isReadOnlyViewer}
+                          onClick={() =>
+                            updateMeta(
+                              'timeOfInspectionEnded',
+                              getCurrentTimeString()
+                            )
+                          }
+                          className="text-[11px] font-semibold text-red-700 hover:text-red-800 hover:underline disabled:opacity-50 whitespace-nowrap"
+                        >
+                          Set Now
+                        </button>
+                        {report.meta.timeOfInspectionEnded && (
+                          <button
+                            type="button"
+                            disabled={isReadOnlyViewer}
+                            onClick={() =>
+                              updateMeta('timeOfInspectionEnded', '')
+                            }
+                            className="text-[11px] font-medium text-slate-500 hover:text-slate-800 hover:underline disabled:opacity-50 whitespace-nowrap"
+                          >
+                            Clear
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                    <input
+                      id="time-inspection-ended"
+                      type="time"
+                      disabled={isReadOnlyViewer}
+                      value={report.meta.timeOfInspectionEnded ?? ''}
+                      onChange={(e) =>
+                        updateMeta('timeOfInspectionEnded', e.target.value)
+                      }
+                      className="w-full h-10 px-3 text-sm bg-white border border-slate-300 rounded-md text-slate-900 tabular-nums disabled:bg-slate-50 disabled:text-slate-500 focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700"
+                    />
+                  </div>
                 </div>
 
-                <div className="px-5 py-3 bg-slate-50 border-t border-slate-200 space-y-1">
+                <div className="px-5 py-3 bg-slate-50 border-t border-slate-200 rounded-b-xl space-y-1">
                   <p className="text-xs text-slate-600 italic leading-relaxed">
                     {HOW_TO_FILL_INSTRUCTION}
                   </p>
@@ -2389,27 +5177,16 @@ export default function App() {
                   <span className="text-slate-300" aria-hidden="true">
                     ·
                   </span>
-                  {user ? (
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setViewMode('reports');
-                        window.scrollTo({ top: 0, behavior: 'smooth' });
-                      }}
-                      className="font-semibold text-slate-700 hover:text-slate-950 hover:underline whitespace-nowrap"
-                    >
-                      Online Reports ({cloudReports.length})
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      onClick={handleSignIn}
-                      disabled={isSigningIn}
-                      className="font-semibold text-slate-700 hover:text-slate-950 hover:underline whitespace-nowrap"
-                    >
-                      Sign in to Save Online
-                    </button>
-                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setViewMode('reports');
+                      window.scrollTo({ top: 0, behavior: 'smooth' });
+                    }}
+                    className="font-semibold text-slate-700 hover:text-slate-950 hover:underline whitespace-nowrap"
+                  >
+                    Online Reports ({cloudReports.length})
+                  </button>
                 </div>
               </section>
 
@@ -2552,6 +5329,7 @@ export default function App() {
                                 report.responses[item.number] ??
                                 createEmptyResponse()
                               }
+                              hdUploadsEnabled={hdUploadsEnabled}
                               onChange={(next) =>
                                 updateItemResponse(item.number, next)
                               }
@@ -2647,8 +5425,8 @@ export default function App() {
                       </h2>
                       <p className="text-xs text-slate-500 mt-0.5">
                         {user
-                          ? 'Uploaded immediately to Firestore when added, with taken timestamp recorded, and included in PDF exports'
-                          : 'Saved locally in IndexedDB with taken timestamp recorded, and included in PDF exports'}
+                          ? `Auto-saved locally & auto-synced to cloud (${hdUploadsEnabled ? 'HD' : 'Standard'}) with taken timestamps, included in exports`
+                          : 'Auto-saved locally in IndexedDB with taken timestamps, included in exports'}
                       </p>
                     </div>
                     <button
@@ -2727,43 +5505,97 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                  <SignaturePad
-                    title="Performed By"
-                    roleSubtitle="Food Safety Compliance Officer"
-                    value={report.signOffs.performedBy}
-                    onChange={(next) =>
-                      mutateReport((prev) => ({
-                        ...prev,
-                        updatedAt: new Date().toISOString(),
-                        signOffs: { ...prev.signOffs, performedBy: next },
-                      }))
-                    }
-                  />
-                  <SignaturePad
-                    title="Acknowledged By"
-                    roleSubtitle="Restaurant / Shift Manager"
-                    value={report.signOffs.acknowledgedBy}
-                    onChange={(next) =>
-                      mutateReport((prev) => ({
-                        ...prev,
-                        updatedAt: new Date().toISOString(),
-                        signOffs: { ...prev.signOffs, acknowledgedBy: next },
-                      }))
-                    }
-                  />
-                  <SignaturePad
-                    title="Noted By"
-                    roleSubtitle="Area Manager"
-                    value={report.signOffs.notedBy}
-                    onChange={(next) =>
-                      mutateReport((prev) => ({
-                        ...prev,
-                        updatedAt: new Date().toISOString(),
-                        signOffs: { ...prev.signOffs, notedBy: next },
-                      }))
-                    }
-                  />
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4">
+                  <div className="lg:col-span-2">
+                    <SignaturePad
+                      title="Performed By"
+                      roleSubtitle="Food Safety Compliance Officer"
+                      value={report.signOffs.performedBy}
+                      readOnly={isReadOnlyViewer}
+                      onChange={(next) =>
+                        mutateReport(
+                          (prev) => ({
+                            ...prev,
+                            updatedAt: new Date().toISOString(),
+                            signOffs: { ...prev.signOffs, performedBy: next },
+                          }),
+                          { signOffKey: 'performedBy' }
+                        )
+                      }
+                    />
+                  </div>
+                  <div className="lg:col-span-2">
+                    <SignaturePad
+                      title="Acknowledged By"
+                      roleSubtitle="Restaurant / Shift Manager"
+                      value={report.signOffs.acknowledgedBy}
+                      readOnly={isReadOnlyViewer}
+                      onChange={(next) =>
+                        mutateReport(
+                          (prev) => ({
+                            ...prev,
+                            updatedAt: new Date().toISOString(),
+                            signOffs: { ...prev.signOffs, acknowledgedBy: next },
+                          }),
+                          { signOffKey: 'acknowledgedBy' }
+                        )
+                      }
+                    />
+                  </div>
+                  <div className="lg:col-span-2">
+                    <SignaturePad
+                      title="Noted By"
+                      roleSubtitle="Area Manager"
+                      value={report.signOffs.notedBy}
+                      readOnly={isReadOnlyViewer}
+                      onChange={(next) =>
+                        mutateReport(
+                          (prev) => ({
+                            ...prev,
+                            updatedAt: new Date().toISOString(),
+                            signOffs: { ...prev.signOffs, notedBy: next },
+                          }),
+                          { signOffKey: 'notedBy' }
+                        )
+                      }
+                    />
+                  </div>
+                  <div className="lg:col-span-3">
+                    <SignaturePad
+                      title="Reviewed By"
+                      roleSubtitle="Learning and Development Manager"
+                      value={report.signOffs.reviewedBy}
+                      readOnly={isReadOnlyViewer}
+                      onChange={(next) =>
+                        mutateReport(
+                          (prev) => ({
+                            ...prev,
+                            updatedAt: new Date().toISOString(),
+                            signOffs: { ...prev.signOffs, reviewedBy: next },
+                          }),
+                          { signOffKey: 'reviewedBy' }
+                        )
+                      }
+                    />
+                  </div>
+                  <div className="md:col-span-2 lg:col-span-3">
+                    <SignaturePad
+                      title="Approved By"
+                      roleSubtitle="Quality Assurance Specialist / FSCO"
+                      value={report.signOffs.approvedBy}
+                      readOnly={isReadOnlyViewer}
+                      onChange={(next) =>
+                        mutateReport(
+                          (prev) => ({
+                            ...prev,
+                            updatedAt: new Date().toISOString(),
+                            signOffs: { ...prev.signOffs, approvedBy: next },
+                          }),
+                          { signOffKey: 'approvedBy' }
+                        )
+                      }
+                    />
+                  </div>
                 </div>
               </section>
 
@@ -2817,6 +5649,19 @@ export default function App() {
                   </button>
                   <button
                     type="button"
+                    onClick={handleExportDocx}
+                    disabled={isExportingDocx}
+                    className="inline-flex items-center gap-1.5 px-4 h-10 text-xs font-semibold text-blue-950 bg-blue-100 hover:bg-blue-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
+                  >
+                    {isExportingDocx ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <FileText className="w-4 h-4" />
+                    )}
+                    {isExportingDocx ? 'Saving DOCX…' : 'Save as DOCX'}
+                  </button>
+                  <button
+                    type="button"
                     onClick={handleExportExcel}
                     disabled={isExportingExcel}
                     className="inline-flex items-center gap-1.5 px-4 h-10 text-xs font-semibold text-emerald-950 bg-emerald-100 hover:bg-emerald-200 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
@@ -2844,12 +5689,17 @@ export default function App() {
                 </div>
               </section>
 
-              {/* Form Footer with automatic Report No. & IQAF-005 Basis */}
-              <footer className="pt-2 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-1 text-[11px] text-slate-500">
-                <span className="font-mono font-semibold text-slate-700 tabular-nums">
-                  Report No.: {currentReportNo}
-                </span>
-                <span>{IQAF_BASIS_STATEMENT}</span>
+              {/* Form Footer with automatic Report No., IQAF-005 Basis, & Confidentiality Notice */}
+              <footer className="pt-2.5 border-t border-slate-200 space-y-1 text-[11px] text-slate-500">
+                <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1">
+                  <span className="font-mono font-semibold text-slate-700 tabular-nums">
+                    Report No.: {currentReportNo}
+                  </span>
+                  <span>{IQAF_BASIS_STATEMENT}</span>
+                </div>
+                <p className="text-[10.5px] italic text-slate-400">
+                  {REPORT_CONFIDENTIALITY_NOTICE}
+                </p>
               </footer>
             </div>
           )}
@@ -2892,6 +5742,8 @@ export default function App() {
         <CameraCaptureModal
           itemNumber={cameraTarget.itemNumber}
           itemText={cameraTarget.itemText}
+          hdUploadsEnabled={hdUploadsEnabled}
+          onToggleHdUploads={handleToggleHdUploads}
           onCaptureComplete={(photo) =>
             attachPhotosToItem(cameraTarget.itemNumber, [photo])
           }
@@ -2911,6 +5763,68 @@ export default function App() {
           }
         />
       )}
+
+      {/* Share Report & Collaboration Modal */}
+      {user &&
+        shareModalReportId &&
+        (() => {
+          const found = cloudReports.find((r) => r.id === shareModalReportId);
+          const summary: CloudReportSummary | null =
+            found
+              ? {
+                  ...found,
+                  reportSequence:
+                    found.reportSequence ?? resolvedSequenceMap.get(found.id),
+                }
+              : shareModalReportId === report.id
+              ? {
+                  id: report.id,
+                  ownerId: user.uid,
+                  ownerName:
+                    user.displayName ||
+                    user.email ||
+                    report.meta.inspectedBy ||
+                    'Inspector',
+                  accessRole: 'owner',
+                  documentationNo: report.meta.documentationNo,
+                  revisionNo: report.meta.revisionNo,
+                  dateOfInspection: report.meta.dateOfInspection,
+                  storeLocation: report.meta.storeLocation,
+                  reportSequence: effectiveReportSequence,
+                  timeOfInspection: report.meta.timeOfInspection,
+                  timeOfInspectionEnded: report.meta.timeOfInspectionEnded ?? '',
+                  inspectedBy: report.meta.inspectedBy,
+                  stats: {
+                    answered: metrics.answered,
+                    yes: metrics.yes,
+                    no: metrics.no,
+                    na: metrics.na,
+                    photoCount: metrics.totalPhotos,
+                  },
+                  photoIds: indexedPhotos.map((p) => p.photo.id),
+                  sharedWithEmails: activeCollaboration?.sharedWithEmails ?? [],
+                  editorEmails: activeCollaboration?.editorEmails ?? [],
+                  activeShareLinkId:
+                    activeCollaboration?.activeShareLinkId ?? null,
+                  activeShareRole:
+                    activeCollaboration?.activeShareRole ?? 'none',
+                  syncVersion: activeCollaboration?.syncVersion ?? 1,
+                  lastEditedByUid: user.uid,
+                  lastEditedByName: user.displayName || user.email || '',
+                  createdAtIso: report.updatedAt,
+                  updatedAtIso: report.updatedAt,
+                }
+              : null;
+          if (!summary) return null;
+          return (
+            <ShareReportModal
+              user={user}
+              reportSummary={summary}
+              onClose={() => setShareModalReportId(null)}
+              onUpdated={(msg) => showToast(msg)}
+            />
+          );
+        })()}
 
       {/* Photo Upload Failure Diagnostic Overlay */}
       <PhotoUploadDiagnosticOverlay
@@ -2934,15 +5848,8 @@ export default function App() {
         }}
       />
 
-      {/* Quiet feedback toast */}
-      {toastMessage && (
-        <div
-          role="status"
-          className="no-print fixed bottom-5 right-5 z-50 bg-slate-900 text-white text-xs font-medium px-4 py-2.5 rounded-lg shadow-lg"
-        >
-          {toastMessage}
-        </div>
-      )}
+      {/* Persistent offline & transient feedback toasts */}
+      {bottomRightToastStack}
     </div>
   );
 }

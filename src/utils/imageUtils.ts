@@ -1,6 +1,29 @@
-const MAX_SAFE_DATAURL_CHARS = 500000;
+export const MAX_STANDARD_DATAURL_CHARS = 500_000;
+export const MAX_HD_DATAURL_CHARS = 860_000;
+export const MAX_FIRESTORE_PHOTO_DATAURL_CHARS = 920_000;
+export const HD_UPLOAD_STORAGE_KEY = 'iqaf005_hd_uploads_enabled';
 
 const IMAGE_EXTENSIONS = /\.(jpe?g|png|webp|gif|bmp|heic|heif|avif)$/i;
+
+export interface PhotoCompressionOptions {
+  hd?: boolean;
+}
+
+export function getHdUploadsPreference(): boolean {
+  try {
+    return localStorage.getItem(HD_UPLOAD_STORAGE_KEY) !== 'false';
+  } catch {
+    return true;
+  }
+}
+
+export function setHdUploadsPreference(enabled: boolean): void {
+  try {
+    localStorage.setItem(HD_UPLOAD_STORAGE_KEY, String(enabled));
+  } catch {
+    // Ignore storage access errors
+  }
+}
 
 /**
  * Generates a collision-proof photo ID valid for Firestore document IDs.
@@ -200,26 +223,45 @@ function isValidImageDataUrl(dataUrl: string): boolean {
 
 /**
  * Directly scales any drawable source (ImageBitmap, HTMLImageElement, HTMLVideoElement,
- * or HTMLCanvasElement) down to <= 960px on the VERY FIRST canvas draw to avoid
- * mobile Safari/Chrome 16.7MP canvas memory limits, and compresses to <= 500KB JPEG.
+ * or HTMLCanvasElement) on the VERY FIRST canvas draw to avoid mobile Safari/Chrome
+ * 16.7MP canvas memory limits, and compresses to a crisp JPEG data URL:
+ * - HD mode (default): up to 1920px Full-HD, <= 900KB (safely within Firestore's 1 MiB cap)
+ * - Standard mode: up to 1280px, <= 500KB for lighter bandwidth/storage
  */
 export function compressDrawableToDataUrl(
   source: CanvasImageSource,
   srcWidth: number,
-  srcHeight: number
+  srcHeight: number,
+  options?: PhotoCompressionOptions
 ): string {
   const safeSrcW = Math.max(1, Math.round(srcWidth || 640));
   const safeSrcH = Math.max(1, Math.round(srcHeight || 480));
+  const useHd = options?.hd ?? getHdUploadsPreference();
+  const maxChars = useHd ? MAX_HD_DATAURL_CHARS : MAX_STANDARD_DATAURL_CHARS;
 
-  const steps: [number, number][] = [
-    [960, 0.78],
-    [820, 0.72],
-    [680, 0.65],
-    [540, 0.58],
-    [420, 0.52],
-    [320, 0.48],
-    [260, 0.42],
-  ];
+  const steps: [number, number][] = useHd
+    ? [
+        [1920, 0.9],
+        [1920, 0.84],
+        [1680, 0.84],
+        [1600, 0.78],
+        [1440, 0.76],
+        [1280, 0.74],
+        [1080, 0.7],
+        [860, 0.65],
+        [640, 0.58],
+        [420, 0.5],
+      ]
+    : [
+        [1280, 0.8],
+        [960, 0.76],
+        [820, 0.72],
+        [680, 0.65],
+        [540, 0.58],
+        [420, 0.52],
+        [320, 0.48],
+        [260, 0.42],
+      ];
 
   const out = document.createElement('canvas');
 
@@ -248,7 +290,7 @@ export function compressDrawableToDataUrl(
     ctx.drawImage(source, 0, 0, width, height);
 
     const dataUrl = out.toDataURL('image/jpeg', quality);
-    if (isValidImageDataUrl(dataUrl) && dataUrl.length <= MAX_SAFE_DATAURL_CHARS) {
+    if (isValidImageDataUrl(dataUrl) && dataUrl.length <= maxChars) {
       // Release backing store memory promptly on mobile devices
       out.width = 0;
       out.height = 0;
@@ -262,16 +304,18 @@ export function compressDrawableToDataUrl(
 }
 
 /**
- * Compresses an HTMLCanvasElement into a guaranteed <= 500KB JPEG data URL
- * suitable for Firestore subcollection storage and PDF embedding.
+ * Compresses an HTMLCanvasElement into a guaranteed Firestore-safe JPEG data URL
+ * suitable for subcollection storage and PDF/DOCX embedding.
  */
 export function compressCanvasToDataUrl(
-  sourceCanvas: HTMLCanvasElement
+  sourceCanvas: HTMLCanvasElement,
+  options?: PhotoCompressionOptions
 ): string {
   return compressDrawableToDataUrl(
     sourceCanvas,
     sourceCanvas.width,
-    sourceCanvas.height
+    sourceCanvas.height,
+    options
   );
 }
 
@@ -306,18 +350,33 @@ function readFileAsDataUrl(file: File): Promise<string> {
 }
 
 /**
- * Compresses an uploaded image file to a crisp, Firestore-safe (<= 500KB) JPEG data URL.
+ * Compresses an uploaded image file to a crisp, Firestore-safe JPEG data URL
+ * (up to 1920px HD / <= 900KB when HD is enabled, or <= 500KB in Standard mode).
  * Uses direct-scaled drawing (never allocates a full 12MP-48MP canvas) with
  * createImageBitmap -> ObjectURL -> FileReader fallback chain for mobile reliability.
  */
-export async function compressImageFile(file: File): Promise<string> {
+export async function compressImageFile(
+  file: File,
+  options?: PhotoCompressionOptions
+): Promise<string> {
   // Strategy 1: createImageBitmap (handles EXIF orientation natively and avoids blob URL issues)
   if (typeof createImageBitmap === 'function') {
     let bitmap: ImageBitmap | null = null;
     try {
-      bitmap = await createImageBitmap(file);
+      try {
+        bitmap = await createImageBitmap(file, {
+          imageOrientation: 'from-image',
+        });
+      } catch {
+        bitmap = await createImageBitmap(file);
+      }
       if (bitmap.width > 0 && bitmap.height > 0) {
-        return compressDrawableToDataUrl(bitmap, bitmap.width, bitmap.height);
+        return compressDrawableToDataUrl(
+          bitmap,
+          bitmap.width,
+          bitmap.height,
+          options
+        );
       }
     } catch {
       // Fall through to HTMLImageElement decoding
@@ -336,7 +395,8 @@ export async function compressImageFile(file: File): Promise<string> {
     return compressDrawableToDataUrl(
       img,
       img.naturalWidth || img.width,
-      img.naturalHeight || img.height
+      img.naturalHeight || img.height,
+      options
     );
   } catch {
     // Fall through to FileReader strategy
@@ -353,7 +413,8 @@ export async function compressImageFile(file: File): Promise<string> {
     return compressDrawableToDataUrl(
       img,
       img.naturalWidth || img.width,
-      img.naturalHeight || img.height
+      img.naturalHeight || img.height,
+      options
     );
   } catch {
     throw new Error(
@@ -363,22 +424,86 @@ export async function compressImageFile(file: File): Promise<string> {
 }
 
 /**
- * Ensures any existing data URL (such as a legacy photo from local storage)
- * is a valid JPEG within the Firestore-safe <= 500KB limit without ever truncating base64.
+ * Ensures any existing data URL (such as a photo from local storage)
+ * is a valid JPEG within the Firestore-safe HD limit (<= 900KB by default)
+ * without ever truncating base64 or downscaling valid HD photos.
  */
-export async function ensureSafePhotoDataUrl(dataUrl: string): Promise<string> {
+export async function ensureSafePhotoDataUrl(
+  dataUrl: string,
+  options?: PhotoCompressionOptions
+): Promise<string> {
   if (!isValidImageDataUrl(dataUrl)) {
     throw new Error('Invalid or corrupted image data.');
   }
-  if (dataUrl.length <= MAX_SAFE_DATAURL_CHARS) {
+  const useHd = options?.hd ?? true;
+  const maxChars = useHd ? MAX_HD_DATAURL_CHARS : MAX_STANDARD_DATAURL_CHARS;
+  if (dataUrl.length <= maxChars) {
     return dataUrl;
   }
   const img = await decodeImageElement(dataUrl);
   return compressDrawableToDataUrl(
     img,
     img.naturalWidth || img.width,
-    img.naturalHeight || img.height
+    img.naturalHeight || img.height,
+    { hd: useHd }
   );
+}
+
+/**
+ * Ensures an electronic sign-off signature PNG/image fits safely within the
+ * 150,000-char Firestore rule ceiling instead of being dropped silently.
+ */
+export async function ensureSafeSignatureDataUrl(
+  dataUrl: string | null | undefined
+): Promise<string | null> {
+  if (!dataUrl || typeof dataUrl !== 'string') return null;
+  if (!isValidImageDataUrl(dataUrl)) return null;
+  // Cap each signature at 95 KB so 5 signatures + 67 responses stay well below Firestore's 1 MiB doc cap
+  if (dataUrl.length <= 95000) return dataUrl;
+
+  try {
+    const img = await decodeImageElement(dataUrl);
+    const srcW = Math.max(1, img.naturalWidth || img.width || 400);
+    const srcH = Math.max(1, img.naturalHeight || img.height || 140);
+    const canvas = document.createElement('canvas');
+
+    for (const [maxW, format, quality] of [
+      [560, 'image/png', undefined],
+      [420, 'image/png', undefined],
+      [520, 'image/jpeg', 0.84],
+      [400, 'image/jpeg', 0.72],
+      [320, 'image/jpeg', 0.62],
+    ] as Array<[number, string, number | undefined]>) {
+      const scale = Math.min(1, maxW / srcW);
+      const w = Math.max(1, Math.round(srcW * scale));
+      const h = Math.max(1, Math.round(srcH * scale));
+      canvas.width = w;
+      canvas.height = h;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) continue;
+      if (format === 'image/jpeg') {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, w, h);
+      } else {
+        ctx.clearRect(0, 0, w, h);
+      }
+      ctx.drawImage(img, 0, 0, w, h);
+      const encoded =
+        quality !== undefined
+          ? canvas.toDataURL(format, quality)
+          : canvas.toDataURL(format);
+      if (encoded.length <= 95000) {
+        canvas.width = 0;
+        canvas.height = 0;
+        return encoded;
+      }
+    }
+    canvas.width = 0;
+    canvas.height = 0;
+  } catch {
+    // Fall back to existing value if <= 145KB
+  }
+  return dataUrl.length <= 145000 ? dataUrl : null;
 }
 
 export function formatTakenTimestamp(iso: string): string {

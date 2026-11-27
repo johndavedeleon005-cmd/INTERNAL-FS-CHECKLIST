@@ -5,6 +5,7 @@ import {
   CheckCircle2,
   Download,
   FileSpreadsheet,
+  FileText,
   Loader2,
   Mail,
   Printer,
@@ -14,8 +15,9 @@ import {
   CHECKLIST_SECTIONS,
   HOW_TO_FILL_INSTRUCTION,
   IQAF_BASIS_STATEMENT,
+  REPORT_CONFIDENTIALITY_NOTICE,
   formatDisplayDate,
-  formatDisplayTime,
+  formatInspectionTimeRange,
   formatReportNo,
 } from '../data/checklistData';
 import type {
@@ -25,6 +27,7 @@ import type {
 } from '../types/inspection';
 import { formatTakenTimestamp } from '../utils/imageUtils';
 import { collectIndexedPhotos } from '../utils/pdfExporter';
+import { BlankSheetMenuButton } from './BlankSheetMenuButton';
 import { JiangNanLogo } from './JiangNanLogo';
 
 interface ReportPreviewProps {
@@ -34,8 +37,13 @@ interface ReportPreviewProps {
   onEmailReport: () => void;
   onExportPdf: () => Promise<void>;
   onExportExcel: () => Promise<void>;
+  onExportDocx: () => Promise<void>;
+  onDownloadBlankPdf: () => Promise<void>;
+  onDownloadBlankExcel: () => Promise<void>;
+  onDownloadBlankDocx: () => Promise<void>;
   isExporting: boolean;
   isExportingExcel: boolean;
+  isExportingDocx: boolean;
   onBackToForm: () => void;
   onInspectPhoto: (itemNumber: number, itemText: string, photo: PhotoProof) => void;
 }
@@ -47,8 +55,13 @@ export function ReportPreview({
   onEmailReport,
   onExportPdf,
   onExportExcel,
+  onExportDocx,
+  onDownloadBlankPdf,
+  onDownloadBlankExcel,
+  onDownloadBlankDocx,
   isExporting,
   isExportingExcel,
+  isExportingDocx,
   onBackToForm,
   onInspectPhoto,
 }: ReportPreviewProps) {
@@ -56,7 +69,8 @@ export function ReportPreview({
 
   const reportNo = formatReportNo(
     report.meta.storeLocation,
-    report.meta.dateOfInspection
+    report.meta.dateOfInspection,
+    report.meta.reportSequence
   );
   const indexedPhotos = useMemo(() => collectIndexedPhotos(report), [report]);
   const photoNumbersByItem = useMemo(() => {
@@ -177,10 +191,17 @@ export function ReportPreview({
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
+            <BlankSheetMenuButton
+              size="md"
+              onDownloadBlankPdf={onDownloadBlankPdf}
+              onDownloadBlankExcel={onDownloadBlankExcel}
+              onDownloadBlankDocx={onDownloadBlankDocx}
+            />
             <button
               type="button"
               onClick={handlePrint}
-              className="inline-flex items-center gap-1.5 px-3.5 h-9 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap"
+              title="Open browser print dialog for this report"
+              className="inline-flex items-center gap-1.5 px-3.5 h-9 text-xs font-semibold text-slate-900 bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap"
             >
               <Printer className="w-3.5 h-3.5" />
               Print
@@ -192,6 +213,19 @@ export function ReportPreview({
             >
               <Mail className="w-3.5 h-3.5 text-red-700" />
               Email Report
+            </button>
+            <button
+              type="button"
+              onClick={onExportDocx}
+              disabled={isExportingDocx}
+              className="inline-flex items-center gap-1.5 px-3.5 h-9 text-xs font-semibold text-blue-800 bg-blue-50 border border-blue-200 hover:bg-blue-100 disabled:opacity-60 rounded-lg transition-colors whitespace-nowrap"
+            >
+              {isExportingDocx ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <FileText className="w-3.5 h-3.5" />
+              )}
+              {isExportingDocx ? 'Saving DOCX…' : 'Save as DOCX'}
             </button>
             <button
               type="button"
@@ -325,6 +359,23 @@ export function ReportPreview({
                 </label>
               </>
             )}
+            <label
+              className="inline-flex items-center gap-1.5 cursor-pointer select-none"
+              title="Stamp diagonal CONFIDENTIAL watermark across every page in the PDF export"
+            >
+              <input
+                type="checkbox"
+                checked={exportOptions.includeConfidentialWatermark !== false}
+                onChange={(e) =>
+                  onChangeExportOptions({
+                    ...exportOptions,
+                    includeConfidentialWatermark: e.target.checked,
+                  })
+                }
+                className="rounded border-slate-300 text-red-700 focus:ring-red-700"
+              />
+              <span>CONFIDENTIAL Watermark</span>
+            </label>
           </div>
         </div>
 
@@ -403,7 +454,10 @@ export function ReportPreview({
                 Time of Inspection:
               </td>
               <td className="px-2.5 py-1.5 bg-white tabular-nums">
-                {formatDisplayTime(report.meta.timeOfInspection)}
+                {formatInspectionTimeRange(
+                  report.meta.timeOfInspection,
+                  report.meta.timeOfInspectionEnded
+                )}
               </td>
             </tr>
             <tr>
@@ -591,6 +645,63 @@ export function ReportPreview({
             </tbody>
           </table>
 
+          <table className="iqaf-table -mt-px">
+            <colgroup>
+              <col style={{ width: '50%' }} />
+              <col style={{ width: '50%' }} />
+            </colgroup>
+            <tbody>
+              <tr className="bg-[#D9D9D9] font-bold text-[11px] text-center">
+                <td className="py-1.5 px-2">Reviewed By</td>
+                <td className="py-1.5 px-2">Approved By</td>
+              </tr>
+              <tr className="bg-white text-center">
+                {(
+                  [
+                    report.signOffs.reviewedBy,
+                    report.signOffs.approvedBy,
+                  ] as const
+                ).map((entry, idx) => (
+                  <td
+                    key={idx}
+                    className="px-2 pt-2 pb-1.5 h-[72px] align-bottom"
+                  >
+                    <div className="flex flex-col items-center justify-end h-full">
+                      {entry.signatureDataUrl && (
+                        <img
+                          src={entry.signatureDataUrl}
+                          alt="Signature"
+                          referrerPolicy="no-referrer"
+                          className="max-h-11 max-w-[140px] object-contain mb-0.5"
+                        />
+                      )}
+                      {(entry.printedName || entry.date) && (
+                        <div className="text-[10px] font-bold text-zinc-900 leading-tight">
+                          {[
+                            entry.printedName.trim(),
+                            entry.date ? formatDisplayDate(entry.date) : '',
+                          ]
+                            .filter(Boolean)
+                            .join(' / ')}
+                        </div>
+                      )}
+                    </div>
+                  </td>
+                ))}
+              </tr>
+              <tr className="bg-white text-center text-[10px] leading-snug">
+                <td className="py-1.5 px-2">
+                  <div>Learning and Development Manager</div>
+                  <div>Signature over printed name / Date</div>
+                </td>
+                <td className="py-1.5 px-2">
+                  <div>Quality Assurance Specialist / FSCO</div>
+                  <div>Signature over printed name / Date</div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+
           <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-[10.5px] text-zinc-900">
             <span className="font-bold">Quality Assurance Department</span>
             <span>
@@ -600,14 +711,19 @@ export function ReportPreview({
             </span>
           </div>
 
-          <div className="mt-3 pt-2 border-t border-zinc-300 flex flex-wrap items-center justify-between gap-2 text-[10px] text-zinc-700">
-            <span className="font-mono font-bold text-zinc-900 tabular-nums">
-              Report No.: {reportNo}
-            </span>
-            <span>
-              Basis: {report.meta.documentationNo || 'IQAF-005'} Store
-              Inspection Checklist
-            </span>
+          <div className="mt-3 pt-2 border-t border-zinc-300 space-y-1 text-[10px] text-zinc-700">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="font-mono font-bold text-zinc-900 tabular-nums">
+                Report No.: {reportNo}
+              </span>
+              <span>
+                Basis: {report.meta.documentationNo || 'IQAF-005'} Store
+                Inspection Checklist
+              </span>
+            </div>
+            <div className="text-[9px] italic text-zinc-500">
+              {REPORT_CONFIDENTIALITY_NOTICE}
+            </div>
           </div>
         </div>
       </div>
@@ -870,14 +986,152 @@ export function ReportPreview({
             </tbody>
           </table>
 
-          <div className="mt-5 pt-2 border-t border-zinc-300 flex flex-wrap items-center justify-between gap-2 text-[10px] text-zinc-700">
-            <span className="font-mono font-bold text-zinc-900 tabular-nums">
-              Report No.: {reportNo}
-            </span>
-            <span>
-              Basis: {report.meta.documentationNo || 'IQAF-005'} Store
-              Inspection Checklist
-            </span>
+          {/* Sign-Off & Verification Block */}
+          <div className="mt-6 iqaf-avoid-break">
+            <table className="iqaf-table">
+              <colgroup>
+                <col style={{ width: '33.333%' }} />
+                <col style={{ width: '33.333%' }} />
+                <col style={{ width: '33.334%' }} />
+              </colgroup>
+              <tbody>
+                <tr className="bg-[#D9D9D9] font-bold text-[11px] text-center">
+                  <td className="py-1.5 px-2">Performed By</td>
+                  <td className="py-1.5 px-2">Acknowledged By</td>
+                  <td className="py-1.5 px-2">Noted By</td>
+                </tr>
+                <tr className="bg-white text-center">
+                  {(
+                    [
+                      report.signOffs.performedBy,
+                      report.signOffs.acknowledgedBy,
+                      report.signOffs.notedBy,
+                    ] as const
+                  ).map((entry, idx) => (
+                    <td
+                      key={idx}
+                      className="px-2 pt-2 pb-1.5 h-[72px] align-bottom"
+                    >
+                      <div className="flex flex-col items-center justify-end h-full">
+                        {entry.signatureDataUrl && (
+                          <img
+                            src={entry.signatureDataUrl}
+                            alt="Signature"
+                            referrerPolicy="no-referrer"
+                            className="max-h-11 max-w-[140px] object-contain mb-0.5"
+                          />
+                        )}
+                        {(entry.printedName || entry.date) && (
+                          <div className="text-[10px] font-bold text-zinc-900 leading-tight">
+                            {[
+                              entry.printedName.trim(),
+                              entry.date ? formatDisplayDate(entry.date) : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' / ')}
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                  ))}
+                </tr>
+                <tr className="bg-white text-center text-[10px] leading-snug">
+                  <td className="py-1.5 px-2">
+                    <div>Food Safety Compliance Officer</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <div>Restaurant / Shift Manager</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <div>Area Manager</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <table className="iqaf-table -mt-px">
+              <colgroup>
+                <col style={{ width: '50%' }} />
+                <col style={{ width: '50%' }} />
+              </colgroup>
+              <tbody>
+                <tr className="bg-[#D9D9D9] font-bold text-[11px] text-center">
+                  <td className="py-1.5 px-2">Reviewed By</td>
+                  <td className="py-1.5 px-2">Approved By</td>
+                </tr>
+                <tr className="bg-white text-center">
+                  {(
+                    [
+                      report.signOffs.reviewedBy,
+                      report.signOffs.approvedBy,
+                    ] as const
+                  ).map((entry, idx) => (
+                    <td
+                      key={idx}
+                      className="px-2 pt-2 pb-1.5 h-[72px] align-bottom"
+                    >
+                      <div className="flex flex-col items-center justify-end h-full">
+                        {entry.signatureDataUrl && (
+                          <img
+                            src={entry.signatureDataUrl}
+                            alt="Signature"
+                            referrerPolicy="no-referrer"
+                            className="max-h-11 max-w-[140px] object-contain mb-0.5"
+                          />
+                        )}
+                        {(entry.printedName || entry.date) && (
+                          <div className="text-[10px] font-bold text-zinc-900 leading-tight">
+                            {[
+                              entry.printedName.trim(),
+                              entry.date ? formatDisplayDate(entry.date) : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' / ')}
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                  ))}
+                </tr>
+                <tr className="bg-white text-center text-[10px] leading-snug">
+                  <td className="py-1.5 px-2">
+                    <div>Learning and Development Manager</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <div>Quality Assurance Specialist / FSCO</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-[10.5px] text-zinc-900">
+              <span className="font-bold">Quality Assurance Department</span>
+              <span>
+                Basis Form #: {report.meta.documentationNo || 'IQAF-005'}
+                <span className="inline-block w-4" />
+                Revision No.: {report.meta.revisionNo || '0'}
+              </span>
+            </div>
+
+            <div className="mt-3 pt-2 border-t border-zinc-300 space-y-1 text-[10px] text-zinc-700">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-mono font-bold text-zinc-900 tabular-nums">
+                  Report No.: {reportNo}
+                </span>
+                <span>
+                  Basis: {report.meta.documentationNo || 'IQAF-005'} Store
+                  Inspection Checklist
+                </span>
+              </div>
+              <div className="text-[9px] italic text-zinc-500">
+                {REPORT_CONFIDENTIALITY_NOTICE}
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -931,7 +1185,7 @@ export function ReportPreview({
             </tbody>
           </table>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 print:grid-cols-2 gap-4">
             {indexedPhotos.map((entry) => (
               <div
                 key={entry.photo.id}
@@ -1000,14 +1254,152 @@ export function ReportPreview({
             ))}
           </div>
 
-          <div className="mt-5 pt-2 border-t border-zinc-300 flex flex-wrap items-center justify-between gap-2 text-[10px] text-zinc-700">
-            <span className="font-mono font-bold text-zinc-900 tabular-nums">
-              Report No.: {reportNo}
-            </span>
-            <span>
-              Basis: {report.meta.documentationNo || 'IQAF-005'} Store
-              Inspection Checklist
-            </span>
+          {/* Sign-Off & Verification Block */}
+          <div className="mt-6 iqaf-avoid-break">
+            <table className="iqaf-table">
+              <colgroup>
+                <col style={{ width: '33.333%' }} />
+                <col style={{ width: '33.333%' }} />
+                <col style={{ width: '33.334%' }} />
+              </colgroup>
+              <tbody>
+                <tr className="bg-[#D9D9D9] font-bold text-[11px] text-center">
+                  <td className="py-1.5 px-2">Performed By</td>
+                  <td className="py-1.5 px-2">Acknowledged By</td>
+                  <td className="py-1.5 px-2">Noted By</td>
+                </tr>
+                <tr className="bg-white text-center">
+                  {(
+                    [
+                      report.signOffs.performedBy,
+                      report.signOffs.acknowledgedBy,
+                      report.signOffs.notedBy,
+                    ] as const
+                  ).map((entry, idx) => (
+                    <td
+                      key={idx}
+                      className="px-2 pt-2 pb-1.5 h-[72px] align-bottom"
+                    >
+                      <div className="flex flex-col items-center justify-end h-full">
+                        {entry.signatureDataUrl && (
+                          <img
+                            src={entry.signatureDataUrl}
+                            alt="Signature"
+                            referrerPolicy="no-referrer"
+                            className="max-h-11 max-w-[140px] object-contain mb-0.5"
+                          />
+                        )}
+                        {(entry.printedName || entry.date) && (
+                          <div className="text-[10px] font-bold text-zinc-900 leading-tight">
+                            {[
+                              entry.printedName.trim(),
+                              entry.date ? formatDisplayDate(entry.date) : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' / ')}
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                  ))}
+                </tr>
+                <tr className="bg-white text-center text-[10px] leading-snug">
+                  <td className="py-1.5 px-2">
+                    <div>Food Safety Compliance Officer</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <div>Restaurant / Shift Manager</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <div>Area Manager</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <table className="iqaf-table -mt-px">
+              <colgroup>
+                <col style={{ width: '50%' }} />
+                <col style={{ width: '50%' }} />
+              </colgroup>
+              <tbody>
+                <tr className="bg-[#D9D9D9] font-bold text-[11px] text-center">
+                  <td className="py-1.5 px-2">Reviewed By</td>
+                  <td className="py-1.5 px-2">Approved By</td>
+                </tr>
+                <tr className="bg-white text-center">
+                  {(
+                    [
+                      report.signOffs.reviewedBy,
+                      report.signOffs.approvedBy,
+                    ] as const
+                  ).map((entry, idx) => (
+                    <td
+                      key={idx}
+                      className="px-2 pt-2 pb-1.5 h-[72px] align-bottom"
+                    >
+                      <div className="flex flex-col items-center justify-end h-full">
+                        {entry.signatureDataUrl && (
+                          <img
+                            src={entry.signatureDataUrl}
+                            alt="Signature"
+                            referrerPolicy="no-referrer"
+                            className="max-h-11 max-w-[140px] object-contain mb-0.5"
+                          />
+                        )}
+                        {(entry.printedName || entry.date) && (
+                          <div className="text-[10px] font-bold text-zinc-900 leading-tight">
+                            {[
+                              entry.printedName.trim(),
+                              entry.date ? formatDisplayDate(entry.date) : '',
+                            ]
+                              .filter(Boolean)
+                              .join(' / ')}
+                          </div>
+                        )}
+                      </div>
+                    </td>
+                  ))}
+                </tr>
+                <tr className="bg-white text-center text-[10px] leading-snug">
+                  <td className="py-1.5 px-2">
+                    <div>Learning and Development Manager</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                  <td className="py-1.5 px-2">
+                    <div>Quality Assurance Specialist / FSCO</div>
+                    <div>Signature over printed name / Date</div>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+
+            <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-[10.5px] text-zinc-900">
+              <span className="font-bold">Quality Assurance Department</span>
+              <span>
+                Basis Form #: {report.meta.documentationNo || 'IQAF-005'}
+                <span className="inline-block w-4" />
+                Revision No.: {report.meta.revisionNo || '0'}
+              </span>
+            </div>
+
+            <div className="mt-3 pt-2 border-t border-zinc-300 space-y-1 text-[10px] text-zinc-700">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="font-mono font-bold text-zinc-900 tabular-nums">
+                  Report No.: {reportNo}
+                </span>
+                <span>
+                  Basis: {report.meta.documentationNo || 'IQAF-005'} Store
+                  Inspection Checklist
+                </span>
+              </div>
+              <div className="text-[9px] italic text-zinc-500">
+                {REPORT_CONFIDENTIALITY_NOTICE}
+              </div>
+            </div>
           </div>
         </div>
       )}
@@ -1037,16 +1429,36 @@ export function ReportPreview({
       <div className="no-print mt-5 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
         <span className="inline-flex items-center gap-1.5">
           <CheckCircle2 className="w-3.5 h-3.5 text-emerald-700" />
-          Export as formatted PDF or multi-sheet Excel (.xlsx) workbook with
-          live compliance formulas and CAPA register.
+          Export as formatted PDF, Word (.docx), or multi-sheet Excel (.xlsx) workbook.
         </span>
-        <div className="flex items-center gap-3 shrink-0">
+        <div className="flex flex-wrap items-center gap-3 shrink-0">
+          <button
+            type="button"
+            onClick={handlePrint}
+            className="font-semibold text-slate-800 hover:text-slate-950 whitespace-nowrap"
+          >
+            Print
+          </button>
+          <span className="text-slate-300" aria-hidden="true">
+            ·
+          </span>
           <button
             type="button"
             onClick={onEmailReport}
             className="font-semibold text-slate-800 hover:text-slate-950 whitespace-nowrap"
           >
             Email Report
+          </button>
+          <span className="text-slate-300" aria-hidden="true">
+            ·
+          </span>
+          <button
+            type="button"
+            onClick={onExportDocx}
+            disabled={isExportingDocx}
+            className="font-semibold text-blue-800 hover:text-blue-900 whitespace-nowrap"
+          >
+            {isExportingDocx ? 'Saving DOCX…' : 'Download Word (.docx)'}
           </button>
           <span className="text-slate-300" aria-hidden="true">
             ·

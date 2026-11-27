@@ -2,23 +2,28 @@
 
 ## 1. Data Invariants
 
-1. **Report Ownership**: Every document in `/reports/{reportId}` must have `ownerId == request.auth.uid`, an authenticated verified user (`request.auth.token.email_verified == true`), and a strict alphanumeric/hyphen/underscore `reportId` (`<= 128` chars).
-2. **Photo Master Gate**: Every document in `/reports/{reportId}/photos/{photoId}` cannot be read (`get`), created, updated, or deleted unless the parent `/reports/{reportId}` exists AND `parent.ownerId == request.auth.uid`.
-3. **Immutable Identity & Timestamps**: `ownerId`, `createdAt`, and (for photos) `reportId` are strictly immutable after creation. All `createdAt` and `updatedAt` fields must equal server `request.time`.
-4. **Strict Schema & Size Guards**: No shadow/ghost keys allowed on create (`hasAll` + `hasOnly`) or update (`affectedKeys().hasOnly(...)`). Every string field has an explicit `.size()` ceiling to prevent resource exhaustion.
-5. **No Blanket List Reads**: `allow list` on both `/reports` and `/reports/{reportId}/photos` enforces `resource.data.ownerId == request.auth.uid` without calling `get()`/`exists()`.
+1. **Verified Identity Required**: Every read and write across `/reports`, `/reports/{reportId}/photos`, and `/shareLinks` requires an authenticated user with a verified email (`request.auth != null && request.auth.token.email_verified == true`).
+2. **Tiered Report Access & Sharing**:
+   - **Owner (`ownerId == request.auth.uid`)**: Full read, edit, share/revoke (`sharedWithEmails`, `editorEmails`, `activeShareLinkId`, `activeShareRole`), and delete rights.
+   - **Editor (`email.lower() in editorEmails && email.lower() in sharedWithEmails`)**: Can read and collaboratively edit report responses, metadata, sign-offs, stats, `photoIds`, `syncVersion`, and upload/update/delete photos on the report. Cannot delete the report or modify sharing permissions (`sharedWithEmails`, `editorEmails`, `activeShareLinkId`, `activeShareRole`).
+   - **Viewer (`email.lower() in sharedWithEmails`, not in `editorEmails`)**: Read-only access to the report and its photos. Cannot modify report content or photos. May leave the shared report by removing only their own email.
+3. **Bounded Collaborator & Photo Lists**: `sharedWithEmails` and `editorEmails` are strictly bounded (`<= 25` entries); `photoIds` is strictly bounded (`<= 250` entries).
+4. **Master Gate on Photos**: Every `get`, `create`, `update`, and `delete` on `/reports/{reportId}/photos/{photoId}` verifies parent `/reports/{reportId}` existence and current role (Owner, Editor, or Viewer) via `get()` after authentication and static schema validation. Revoking a collaborator on the parent report immediately revokes all photo access.
+5. **Secret-Gated Share Link Claiming**: `/shareLinks/{shareId}` contains zero PII/emails and cannot be listed by non-owners. A verified user claiming a share link on `/reports/{reportId}` must supply the exact secret `activeShareLinkId` in `lastClaimedShareLinkId`, verify the link is `active == true` and matches `reportId`, and can only append their own verified lowercase email to `sharedWithEmails` (and `editorEmails` only when `activeShareRole == 'editor'`).
+6. **Immutable Identity & Server Timestamps**: `ownerId`, `createdAt`, `reportId` (on photos & shareLinks), and `uploadedByUid` (on photos) are immutable after creation. All `createdAt` and `updatedAt` fields strictly equal `request.time`.
+7. **Zero `get()`/`exists()` in `allow list`**: Every `allow list` rule validates `resource.data` directly against `request.auth.uid` or `request.auth.token.email.lower()`.
 
 ## 2. The "Dirty Dozen" Adversarial Payloads (Must All Return PERMISSION_DENIED)
 
 1. **Unauthenticated Create**: Anonymous client attempts `create` on `/reports/rep-1` with valid schema.
-2. **Unverified Email Spoof**: Authenticated client with `email_verified: false` attempts `create` or `update` on `/reports/rep-1`.
+2. **Unverified Email Spoof**: Authenticated client with `email_verified: false` attempts `create`, `update`, or `get` on `/reports/rep-1`.
 3. **Owner Identity Spoofing**: User A attempts `create` on `/reports/rep-2` setting `ownerId: "user-b"`.
-4. **Cross-User Read (PII/Data Leak)**: User B attempts `get` on User A's `/reports/rep-1` or `/reports/rep-1/photos/ph-1`.
-5. **Blanket List Scraping**: User B attempts `list` on `/reports` without `where('ownerId', '==', 'user-b')`.
-6. **Shadow / Ghost Field Injection**: User A attempts `create` or `update` on `/reports/rep-1` adding an undeclared key `isAdmin: true`.
-7. **ID Poisoning**: User A attempts `create` on `/reports/rep..invalid$chars` or a 200-char ID.
-8. **Immutable Field Tampering**: User A attempts `update` on `/reports/rep-1` modifying `ownerId` or `createdAt`.
-9. **Client Timestamp Forgery**: User A attempts `create` or `update` with a backdated `updatedAt` timestamp instead of `serverTimestamp()` (`request.time`).
-10. **Orphaned Photo Write**: User A attempts `create` on `/reports/nonexistent-report/photos/ph-1` where parent report does not exist.
-11. **Cross-Owner Photo Injection**: User B attempts `create` on `/reports/user-a-report/photos/ph-evil` with `ownerId: "user-b"`.
-12. **Value Poisoning / Oversized Payload**: User A attempts `update` on `/reports/rep-1/photos/ph-1` setting `caption` to a 2,000-char string (exceeding `maxLength: 500`) or `itemNumber: 999` (outside 1..67).
+4. **Cross-User Read (PII/Data Leak)**: User B (not in `sharedWithEmails`) attempts `get` on User A's `/reports/rep-1` or `/reports/rep-1/photos/ph-1`.
+5. **Blanket List Scraping**: User B attempts `list` on `/reports` or `/shareLinks` without matching `ownerId` or `sharedWithEmails`.
+6. **Shadow / Ghost Field Injection**: Owner or Editor attempts `create` or `update` adding an undeclared key `isAdmin: true`.
+7. **ID Poisoning**: User attempts `create` on `/reports/rep..invalid$chars` or a 200-char document ID.
+8. **Viewer Privilege Escalation**: A Viewer collaborator attempts `update` on `/reports/rep-1` to edit `responses` or add themselves to `editorEmails`.
+9. **Editor Sharing Hijack**: An Editor collaborator attempts `update` on `/reports/rep-1` to add another email to `sharedWithEmails`, change `ownerId`, or `delete` the report.
+10. **Share Link Guessing / Hijack**: User C attempts `update` on `/reports/rep-1` to add themselves to `sharedWithEmails` without supplying the matching secret `lastClaimedShareLinkId`, or using a revoked (`active: false`) share link.
+11. **Orphaned / Cross-Owner Photo Write**: User attempts `create` on `/reports/nonexistent/photos/ph-1` or sets `uploadedByUid` to someone else's UID.
+12. **Value Poisoning & Client Timestamp Forgery**: User attempts `update` with a backdated `updatedAt`, an oversized `caption` (> 500 chars), > 25 `sharedWithEmails`, or `syncVersion: -5`.

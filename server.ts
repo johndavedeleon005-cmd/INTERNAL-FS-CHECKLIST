@@ -57,12 +57,500 @@ function validateDeviations(raw: unknown): DeviationInput[] | null {
   return validated;
 }
 
+interface ServerCloudStore {
+  reports: Record<string, Record<string, unknown>>;
+  photos: Record<string, Record<string, Record<string, unknown>>>;
+  shareLinks: Record<string, Record<string, unknown>>;
+}
+
+const VALID_ID_REGEX = /^[a-zA-Z0-9_-]{1,128}$/;
+const UNSAFE_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+function isValidEntityId(id: unknown): id is string {
+  return (
+    typeof id === 'string' &&
+    VALID_ID_REGEX.test(id) &&
+    !UNSAFE_KEYS.has(id)
+  );
+}
+
+function sanitizePlainObject(
+  input: unknown,
+  depth = 0
+): Record<string, unknown> {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || depth > 5) {
+    return {};
+  }
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(input as Record<string, unknown>)) {
+    if (UNSAFE_KEYS.has(k) || k.length > 128) continue;
+    if (
+      v === null ||
+      typeof v === 'string' ||
+      typeof v === 'number' ||
+      typeof v === 'boolean'
+    ) {
+      out[k] = v;
+    } else if (Array.isArray(v)) {
+      out[k] = v
+        .slice(0, 500)
+        .filter(
+          (item) =>
+            typeof item === 'string' ||
+            typeof item === 'number' ||
+            typeof item === 'boolean'
+        );
+    } else if (typeof v === 'object') {
+      out[k] = sanitizePlainObject(v, depth + 1);
+    }
+  }
+  return out;
+}
+
+const DATA_DIR = path.resolve(__dirname, '.data');
+const CLOUD_DB_FILE = path.join(DATA_DIR, 'cloud-db.json');
+
+function loadCloudStore(): ServerCloudStore {
+  try {
+    if (fs.existsSync(CLOUD_DB_FILE)) {
+      const raw = fs.readFileSync(CLOUD_DB_FILE, 'utf8');
+      const parsed = JSON.parse(raw) as Partial<ServerCloudStore>;
+      return {
+        reports:
+          parsed.reports && typeof parsed.reports === 'object'
+            ? parsed.reports
+            : {},
+        photos:
+          parsed.photos && typeof parsed.photos === 'object'
+            ? parsed.photos
+            : {},
+        shareLinks:
+          parsed.shareLinks && typeof parsed.shareLinks === 'object'
+            ? parsed.shareLinks
+            : {},
+      };
+    }
+  } catch (err) {
+    console.warn('[CloudStore] Starting fresh store after load warning:', err);
+  }
+  return { reports: {}, photos: {}, shareLinks: {} };
+}
+
+const cloudStore: ServerCloudStore = loadCloudStore();
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+
+function persistCloudStoreSync(): void {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const tmpFile = `${CLOUD_DB_FILE}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify(cloudStore), 'utf8');
+    fs.renameSync(tmpFile, CLOUD_DB_FILE);
+  } catch (err) {
+    console.error('[CloudStore] Failed to persist cloud store:', err);
+  }
+}
+
+function schedulePersistCloudStore(): void {
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    persistCloudStoreSync();
+  }, 150);
+}
+
 async function startServer() {
   const app = express();
-  app.use(express.json({ limit: '512kb' }));
+  app.use(express.json({ limit: '25mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  // ==========================================================================
+  // Server-Side Cloud Database API (Automatic Failover & Mirror for Firestore)
+  // ==========================================================================
+
+  app.get('/api/cloud/reports', (_req, res) => {
+    const list = Object.entries(cloudStore.reports).map(([id, data]) => ({
+      id,
+      data,
+    }));
+    res.json({ reports: list });
+  });
+
+  app.get('/api/cloud/reports/:reportId', (req, res) => {
+    const { reportId } = req.params;
+    if (!isValidEntityId(reportId)) {
+      res.status(400).json({ error: 'Invalid report ID.' });
+      return;
+    }
+    const reportData = Object.prototype.hasOwnProperty.call(
+      cloudStore.reports,
+      reportId
+    )
+      ? cloudStore.reports[reportId]
+      : null;
+
+    if (!reportData) {
+      res.json({ exists: false, id: reportId, data: null, photos: [] });
+      return;
+    }
+
+    const reportPhotosMap = Object.prototype.hasOwnProperty.call(
+      cloudStore.photos,
+      reportId
+    )
+      ? cloudStore.photos[reportId]
+      : {};
+    const photos = Object.entries(reportPhotosMap).map(([id, data]) => ({
+      id,
+      data,
+    }));
+
+    res.json({
+      exists: true,
+      id: reportId,
+      data: reportData,
+      photos,
+    });
+  });
+
+  app.post('/api/cloud/reports/:reportId', (req, res) => {
+    const { reportId } = req.params;
+    if (!isValidEntityId(reportId)) {
+      res.status(400).json({ error: 'Invalid report ID.' });
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | undefined;
+    if (!body || typeof body !== 'object') {
+      res.status(400).json({ error: 'Invalid request payload.' });
+      return;
+    }
+
+    const incomingData = sanitizePlainObject(body.data);
+    const shouldMerge = body.merge !== false;
+    const nowIso = new Date().toISOString();
+
+    const existing =
+      shouldMerge &&
+      Object.prototype.hasOwnProperty.call(cloudStore.reports, reportId)
+        ? cloudStore.reports[reportId]
+        : null;
+
+    const merged: Record<string, unknown> = existing
+      ? { ...existing, ...incomingData }
+      : { ...incomingData, createdAt: incomingData.createdAt || nowIso };
+
+    if (existing) {
+      if (
+        existing.responses &&
+        typeof existing.responses === 'object' &&
+        incomingData.responses &&
+        typeof incomingData.responses === 'object'
+      ) {
+        merged.responses = {
+          ...(existing.responses as Record<string, unknown>),
+          ...(incomingData.responses as Record<string, unknown>),
+        };
+      }
+      if (
+        existing.signOffs &&
+        typeof existing.signOffs === 'object' &&
+        incomingData.signOffs &&
+        typeof incomingData.signOffs === 'object'
+      ) {
+        merged.signOffs = {
+          ...(existing.signOffs as Record<string, unknown>),
+          ...(incomingData.signOffs as Record<string, unknown>),
+        };
+      }
+      if (
+        existing.stats &&
+        typeof existing.stats === 'object' &&
+        incomingData.stats &&
+        typeof incomingData.stats === 'object'
+      ) {
+        merged.stats = {
+          ...(existing.stats as Record<string, unknown>),
+          ...(incomingData.stats as Record<string, unknown>),
+        };
+      }
+    }
+
+    const currentPhotoIds = new Set<string>(
+      Array.isArray(merged.photoIds)
+        ? (merged.photoIds as unknown[]).filter(isValidEntityId)
+        : Array.isArray(existing?.photoIds)
+          ? (existing.photoIds as unknown[]).filter(isValidEntityId)
+          : []
+    );
+
+    if (Array.isArray(body.unionPhotoIds)) {
+      for (const pid of body.unionPhotoIds) {
+        if (isValidEntityId(pid)) currentPhotoIds.add(pid);
+      }
+    }
+    if (Array.isArray(body.removePhotoIds)) {
+      for (const pid of body.removePhotoIds) {
+        if (typeof pid === 'string') currentPhotoIds.delete(pid);
+      }
+    }
+    if (Array.isArray(body.unionSharedWithEmails)) {
+      const emails = new Set<string>(
+        Array.isArray(merged.sharedWithEmails)
+          ? (merged.sharedWithEmails as unknown[]).map(String)
+          : []
+      );
+      for (const em of body.unionSharedWithEmails) {
+        if (typeof em === 'string' && em.length <= 254) emails.add(em);
+      }
+      merged.sharedWithEmails = Array.from(emails);
+    }
+    if (Array.isArray(body.removeSharedWithEmails)) {
+      const rem = new Set(body.removeSharedWithEmails.map(String));
+      merged.sharedWithEmails = (
+        Array.isArray(merged.sharedWithEmails) ? merged.sharedWithEmails : []
+      ).filter((e) => !rem.has(String(e)));
+    }
+    if (Array.isArray(body.unionEditorEmails)) {
+      const emails = new Set<string>(
+        Array.isArray(merged.editorEmails)
+          ? (merged.editorEmails as unknown[]).map(String)
+          : []
+      );
+      for (const em of body.unionEditorEmails) {
+        if (typeof em === 'string' && em.length <= 254) emails.add(em);
+      }
+      merged.editorEmails = Array.from(emails);
+    }
+    if (Array.isArray(body.removeEditorEmails)) {
+      const rem = new Set(body.removeEditorEmails.map(String));
+      merged.editorEmails = (
+        Array.isArray(merged.editorEmails) ? merged.editorEmails : []
+      ).filter((e) => !rem.has(String(e)));
+    }
+
+    merged.photoIds = Array.from(currentPhotoIds).slice(0, 250);
+    merged.updatedAt = nowIso;
+
+    cloudStore.reports[reportId] = merged;
+    schedulePersistCloudStore();
+
+    res.json({
+      ok: true,
+      id: reportId,
+      updatedAt: nowIso,
+      data: merged,
+    });
+  });
+
+  app.delete('/api/cloud/reports/:reportId', (req, res) => {
+    const { reportId } = req.params;
+    if (!isValidEntityId(reportId)) {
+      res.status(400).json({ error: 'Invalid report ID.' });
+      return;
+    }
+
+    const existing = cloudStore.reports[reportId];
+    if (
+      existing &&
+      typeof existing.activeShareLinkId === 'string' &&
+      isValidEntityId(existing.activeShareLinkId)
+    ) {
+      delete cloudStore.shareLinks[existing.activeShareLinkId];
+    }
+
+    delete cloudStore.reports[reportId];
+    delete cloudStore.photos[reportId];
+    schedulePersistCloudStore();
+
+    res.json({ ok: true });
+  });
+
+  app.post('/api/cloud/reports/:reportId/photos', (req, res) => {
+    const { reportId } = req.params;
+    if (!isValidEntityId(reportId)) {
+      res.status(400).json({ error: 'Invalid report ID.' });
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | undefined;
+    if (!body || !Array.isArray(body.photos)) {
+      res.status(400).json({ error: 'Expected photos array.' });
+      return;
+    }
+
+    if (!Object.prototype.hasOwnProperty.call(cloudStore.photos, reportId)) {
+      cloudStore.photos[reportId] = {};
+    }
+    const reportPhotos = cloudStore.photos[reportId];
+    const nowIso = new Date().toISOString();
+    const addedPhotoIds: string[] = [];
+
+    for (const rawEntry of body.photos.slice(0, 250)) {
+      if (!rawEntry || typeof rawEntry !== 'object') continue;
+      const entry = rawEntry as Record<string, unknown>;
+      const photoId = entry.id;
+      if (!isValidEntityId(photoId)) continue;
+
+      const incoming = sanitizePlainObject(entry.data);
+      const existingPhoto = Object.prototype.hasOwnProperty.call(
+        reportPhotos,
+        photoId
+      )
+        ? reportPhotos[photoId]
+        : null;
+
+      reportPhotos[photoId] = existingPhoto
+        ? { ...existingPhoto, ...incoming, updatedAt: nowIso }
+        : {
+            ...incoming,
+            createdAt: incoming.createdAt || nowIso,
+            updatedAt: nowIso,
+          };
+      addedPhotoIds.push(photoId);
+    }
+
+    if (
+      addedPhotoIds.length > 0 &&
+      Object.prototype.hasOwnProperty.call(cloudStore.reports, reportId)
+    ) {
+      const rep = cloudStore.reports[reportId];
+      const existingIds = Array.isArray(rep.photoIds)
+        ? (rep.photoIds as unknown[]).filter(isValidEntityId)
+        : [];
+      const nextIds = Array.from(
+        new Set([...existingIds, ...addedPhotoIds])
+      ).slice(0, 250);
+      rep.photoIds = nextIds;
+      const prevStats =
+        rep.stats && typeof rep.stats === 'object'
+          ? (rep.stats as Record<string, unknown>)
+          : {};
+      rep.stats = {
+        ...prevStats,
+        photoCount: Object.keys(reportPhotos).length,
+      };
+      rep.updatedAt = nowIso;
+    }
+
+    schedulePersistCloudStore();
+    res.json({ ok: true, count: addedPhotoIds.length });
+  });
+
+  app.delete('/api/cloud/reports/:reportId/photos', (req, res) => {
+    const { reportId } = req.params;
+    if (!isValidEntityId(reportId)) {
+      res.status(400).json({ error: 'Invalid report ID.' });
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | undefined;
+    const rawIds = Array.isArray(body?.photoIds) ? body.photoIds : [];
+    const validIds = rawIds.filter(isValidEntityId);
+
+    const reportPhotos = Object.prototype.hasOwnProperty.call(
+      cloudStore.photos,
+      reportId
+    )
+      ? cloudStore.photos[reportId]
+      : null;
+
+    if (reportPhotos) {
+      for (const pid of validIds) {
+        delete reportPhotos[pid];
+      }
+    }
+
+    if (Object.prototype.hasOwnProperty.call(cloudStore.reports, reportId)) {
+      const rep = cloudStore.reports[reportId];
+      const removedSet = new Set(validIds);
+      const remainingIds = (
+        Array.isArray(rep.photoIds) ? (rep.photoIds as unknown[]) : []
+      )
+        .filter(isValidEntityId)
+        .filter((id) => !removedSet.has(id));
+      rep.photoIds = remainingIds;
+      const prevStats =
+        rep.stats && typeof rep.stats === 'object'
+          ? (rep.stats as Record<string, unknown>)
+          : {};
+      rep.stats = {
+        ...prevStats,
+        photoCount: reportPhotos
+          ? Object.keys(reportPhotos).length
+          : remainingIds.length,
+      };
+      rep.updatedAt = new Date().toISOString();
+    }
+
+    schedulePersistCloudStore();
+    res.json({ ok: true });
+  });
+
+  app.get('/api/cloud/photos', (req, res) => {
+    const rawIds =
+      typeof req.query.reportIds === 'string'
+        ? req.query.reportIds.split(',')
+        : [];
+    const reportIds = rawIds.map((s) => s.trim()).filter(isValidEntityId);
+    const results: Array<{
+      id: string;
+      reportId: string;
+      data: Record<string, unknown>;
+    }> = [];
+
+    for (const rid of reportIds) {
+      const map = Object.prototype.hasOwnProperty.call(cloudStore.photos, rid)
+        ? cloudStore.photos[rid]
+        : null;
+      if (!map) continue;
+      for (const [pid, pdata] of Object.entries(map)) {
+        results.push({ id: pid, reportId: rid, data: pdata });
+      }
+    }
+
+    res.json({ photos: results });
+  });
+
+  app.get('/api/cloud/share-links/:shareId', (req, res) => {
+    const { shareId } = req.params;
+    if (!isValidEntityId(shareId)) {
+      res.status(400).json({ error: 'Invalid share ID.' });
+      return;
+    }
+    const data = Object.prototype.hasOwnProperty.call(
+      cloudStore.shareLinks,
+      shareId
+    )
+      ? cloudStore.shareLinks[shareId]
+      : null;
+    res.json({ exists: Boolean(data), id: shareId, data });
+  });
+
+  app.post('/api/cloud/share-links/:shareId', (req, res) => {
+    const { shareId } = req.params;
+    if (!isValidEntityId(shareId)) {
+      res.status(400).json({ error: 'Invalid share ID.' });
+      return;
+    }
+    const body = req.body as Record<string, unknown> | undefined;
+    const incoming = sanitizePlainObject(body?.data);
+    const nowIso = new Date().toISOString();
+    const existing = Object.prototype.hasOwnProperty.call(
+      cloudStore.shareLinks,
+      shareId
+    )
+      ? cloudStore.shareLinks[shareId]
+      : null;
+    cloudStore.shareLinks[shareId] = existing
+      ? { ...existing, ...incoming, updatedAt: nowIso }
+      : { ...incoming, createdAt: nowIso, updatedAt: nowIso };
+    schedulePersistCloudStore();
+    res.json({ ok: true, id: shareId, data: cloudStore.shareLinks[shareId] });
   });
 
   app.post('/api/ai/deviation-suggestions', async (req, res) => {

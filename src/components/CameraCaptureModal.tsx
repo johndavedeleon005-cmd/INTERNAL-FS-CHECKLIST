@@ -21,6 +21,8 @@ import {
 interface CameraCaptureModalProps {
   itemNumber: number;
   itemText: string;
+  hdUploadsEnabled?: boolean;
+  onToggleHdUploads?: (enabled: boolean) => void;
   onCaptureComplete: (photo: PhotoProof) => void;
   onClose: () => void;
 }
@@ -28,6 +30,8 @@ interface CameraCaptureModalProps {
 export function CameraCaptureModal({
   itemNumber,
   itemText,
+  hdUploadsEnabled = true,
+  onToggleHdUploads,
   onCaptureComplete,
   onClose,
 }: CameraCaptureModalProps) {
@@ -98,8 +102,8 @@ export function CameraCaptureModal({
         const stream = await navigator.mediaDevices.getUserMedia({
           video: {
             facingMode: { ideal: facingMode },
-            width: { ideal: 1280 },
-            height: { ideal: 960 },
+            width: { ideal: hdUploadsEnabled ? 1920 : 1280 },
+            height: { ideal: hdUploadsEnabled ? 1440 : 960 },
           },
           audio: false,
         });
@@ -129,7 +133,7 @@ export function CameraCaptureModal({
       cancelled = true;
       stopStream();
     };
-  }, [facingMode, capturedPreview]);
+  }, [facingMode, capturedPreview, hdUploadsEnabled]);
 
   const handleTakePhoto = () => {
     const video = videoRef.current;
@@ -149,7 +153,8 @@ export function CameraCaptureModal({
       const dataUrl = compressDrawableToDataUrl(
         video,
         video.videoWidth,
-        video.videoHeight
+        video.videoHeight,
+        { hd: hdUploadsEnabled }
       );
       const capturedAt = new Date().toISOString();
 
@@ -177,7 +182,7 @@ export function CameraCaptureModal({
     setCameraError(null);
     try {
       const [dataUrl, taken] = await Promise.all([
-        compressImageFile(file),
+        compressImageFile(file, { hd: hdUploadsEnabled }),
         extractPhotoTakenTimestamp(file, true),
       ]);
       onCaptureComplete({
@@ -241,14 +246,41 @@ export function CameraCaptureModal({
               {itemText}
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="p-1.5 rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors shrink-0"
-            aria-label="Close camera"
-          >
-            <X className="w-5 h-5" />
-          </button>
+          <div className="flex items-center gap-2 shrink-0">
+            {onToggleHdUploads && (
+              <button
+                type="button"
+                role="switch"
+                aria-checked={hdUploadsEnabled}
+                onClick={() => onToggleHdUploads(!hdUploadsEnabled)}
+                title={
+                  hdUploadsEnabled
+                    ? 'HD photo capture enabled (up to 1920px)'
+                    : 'Standard photo capture enabled (up to 1280px)'
+                }
+                className={`inline-flex items-center gap-1.5 h-7 px-2 rounded-md text-[11px] font-semibold border transition-colors whitespace-nowrap ${
+                  hdUploadsEnabled
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100'
+                    : 'bg-slate-50 text-slate-600 border-slate-200 hover:bg-slate-100'
+                }`}
+              >
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    hdUploadsEnabled ? 'bg-emerald-500' : 'bg-slate-400'
+                  }`}
+                />
+                {hdUploadsEnabled ? 'HD 1080p+' : 'Standard'}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onClose}
+              className="p-1.5 rounded-md text-slate-500 hover:text-slate-900 hover:bg-slate-100 transition-colors shrink-0"
+              aria-label="Close camera"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
 
         {/* Camera Viewport or Captured Preview */}

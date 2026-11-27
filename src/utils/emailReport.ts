@@ -2,10 +2,11 @@ import {
   ALL_CHECKLIST_ITEMS,
   CHECKLIST_SECTIONS,
   IQAF_BASIS_STATEMENT,
+  REPORT_CONFIDENTIALITY_NOTICE,
   TOTAL_ITEMS_COUNT,
   createEmptyResponse,
   formatDisplayDate,
-  formatDisplayTime,
+  formatInspectionTimeRange,
   formatReportNo,
 } from '../data/checklistData';
 import type { InspectionReport } from '../types/inspection';
@@ -149,13 +150,17 @@ export function computeReportEmailData(
   return {
     reportNo: formatReportNo(
       report.meta.storeLocation,
-      report.meta.dateOfInspection
+      report.meta.dateOfInspection,
+      report.meta.reportSequence
     ),
     storeLocation: report.meta.storeLocation.trim() || 'Store Branch Not Set',
     dateFormatted:
       formatDisplayDate(report.meta.dateOfInspection) || 'Not specified',
     timeFormatted:
-      formatDisplayTime(report.meta.timeOfInspection) || 'Not specified',
+      formatInspectionTimeRange(
+        report.meta.timeOfInspection,
+        report.meta.timeOfInspectionEnded
+      ) || 'Not specified',
     inspectedBy: report.meta.inspectedBy.trim() || 'Not specified',
     documentationNo: report.meta.documentationNo || 'IQAF-005',
     revisionNo: report.meta.revisionNo || '0',
@@ -190,6 +195,20 @@ export function computeReportEmailData(
         name: report.signOffs.notedBy.printedName.trim(),
         date: formatDisplayDate(report.signOffs.notedBy.date),
         signed: Boolean(report.signOffs.notedBy.signatureDataUrl),
+      },
+      {
+        label: 'Reviewed By',
+        role: 'Learning and Development Manager',
+        name: report.signOffs.reviewedBy.printedName.trim(),
+        date: formatDisplayDate(report.signOffs.reviewedBy.date),
+        signed: Boolean(report.signOffs.reviewedBy.signatureDataUrl),
+      },
+      {
+        label: 'Approved By',
+        role: 'Quality Assurance Specialist / FSCO',
+        name: report.signOffs.approvedBy.printedName.trim(),
+        date: formatDisplayDate(report.signOffs.approvedBy.date),
+        signed: Boolean(report.signOffs.approvedBy.signatureDataUrl),
       },
     ],
   };
@@ -413,6 +432,7 @@ export function buildEmailPlainText({
   lines.push('-'.repeat(64));
   lines.push(`Report No.: ${reportData.reportNo}`);
   lines.push(IQAF_BASIS_STATEMENT);
+  lines.push(REPORT_CONFIDENTIALITY_NOTICE);
   if (includeAiSuggestions && aiAnalysis) {
     lines.push(
       'Note: AI-generated suggestions are provided in this email summary only and are not part of the official IQAF-005 PDF or Excel report.'
@@ -532,17 +552,25 @@ export function buildEmailHtml({
     })
     .join('');
 
-  const signOffCellsHtml = reportData.signOffs
-    .map(
-      (slot) => `<td style="width:33.33%;padding:10px;border:1px solid #e2e8f0;vertical-align:top;background:#f8fafc;">
+  const renderSignOffCell = (
+    slot: ComputedEmailReportData['signOffs'][number],
+    widthPct: string
+  ) => `<td style="width:${widthPct};padding:10px;border:1px solid #e2e8f0;vertical-align:top;background:#f8fafc;">
         <div style="font-size:11.5px;font-weight:700;color:#0f172a;">${escapeHtml(slot.label)}</div>
         <div style="font-size:11px;color:#64748b;margin-bottom:6px;">${escapeHtml(slot.role)}</div>
         <div style="font-size:12px;color:#0f172a;font-weight:600;">${slot.name ? escapeHtml(slot.name) : '<span style="color:#94a3b8;font-weight:400;">Name pending</span>'}</div>
         <div style="font-size:11px;color:${slot.signed ? '#047857' : '#b45309'};margin-top:3px;font-weight:600;">
           ${slot.signed ? 'Signed' : 'Signature pending'}${slot.date ? ` · ${escapeHtml(slot.date)}` : ''}
         </div>
-      </td>`
-    )
+      </td>`;
+
+  const topSignOffCellsHtml = reportData.signOffs
+    .slice(0, 3)
+    .map((slot) => renderSignOffCell(slot, '33.33%'))
+    .join('');
+  const bottomSignOffCellsHtml = reportData.signOffs
+    .slice(3)
+    .map((slot) => renderSignOffCell(slot, '50%'))
     .join('');
 
   return `<!doctype html>
@@ -670,11 +698,20 @@ export function buildEmailHtml({
                 <h2 style="margin:0 0 10px 0;font-size:15px;font-weight:700;color:#0f172a;">
                   Sign-Off Status
                 </h2>
-                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-bottom:18px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
                   <tr>
-                    ${signOffCellsHtml}
+                    ${topSignOffCellsHtml}
                   </tr>
                 </table>
+                ${
+                  bottomSignOffCellsHtml
+                    ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:-1px;margin-bottom:18px;">
+                        <tr>
+                          ${bottomSignOffCellsHtml}
+                        </tr>
+                      </table>`
+                    : ''
+                }
               </td>
             </tr>
 
@@ -685,6 +722,9 @@ export function buildEmailHtml({
                   Report No.: ${escapeHtml(reportData.reportNo)}
                 </div>
                 <div>${escapeHtml(IQAF_BASIS_STATEMENT)}</div>
+                <div style="margin-top:4px;font-style:italic;color:#64748b;">
+                  ${escapeHtml(REPORT_CONFIDENTIALITY_NOTICE)}
+                </div>
                 ${
                   includeAiSuggestions && aiAnalysis
                     ? `<div style="margin-top:4px;color:#64748b;">

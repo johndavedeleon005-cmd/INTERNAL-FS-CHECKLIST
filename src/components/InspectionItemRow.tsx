@@ -32,6 +32,7 @@ import {
 interface InspectionItemRowProps {
   item: ChecklistItemDef;
   response: ItemResponse;
+  hdUploadsEnabled?: boolean;
   onChange: (next: ItemResponse) => void;
   onOpenCamera: () => void;
   onAddPhotos: (photos: PhotoProof[]) => void;
@@ -54,6 +55,7 @@ const STATUS_OPTIONS: {
 export function InspectionItemRow({
   item,
   response,
+  hdUploadsEnabled = true,
   onChange,
   onOpenCamera,
   onAddPhotos,
@@ -105,7 +107,7 @@ export function InspectionItemRow({
         }
         try {
           const [dataUrl, taken] = await Promise.all([
-            compressImageFile(file),
+            compressImageFile(file, { hd: hdUploadsEnabled }),
             extractPhotoTakenTimestamp(file, false),
           ]);
           added.push({

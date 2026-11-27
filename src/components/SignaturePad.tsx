@@ -7,6 +7,7 @@ interface SignaturePadProps {
   roleSubtitle: string;
   value: SignOffEntry;
   onChange: (next: SignOffEntry) => void;
+  readOnly?: boolean;
 }
 
 export function SignaturePad({
@@ -14,6 +15,7 @@ export function SignaturePad({
   roleSubtitle,
   value,
   onChange,
+  readOnly = false,
 }: SignaturePadProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [isEditing, setIsEditing] = useState(false);
@@ -144,7 +146,7 @@ export function SignaturePad({
           <p className="text-xs text-slate-500 mt-0.5">{roleSubtitle}</p>
         </div>
 
-        {!isEditing && value.signatureDataUrl && (
+        {!readOnly && !isEditing && value.signatureDataUrl && (
           <div className="flex items-center gap-1 shrink-0">
             <button
               type="button"
@@ -242,20 +244,28 @@ export function SignaturePad({
         </div>
       ) : (
         <div className="h-28 border border-dashed border-slate-300 rounded-md bg-slate-50/70 flex flex-col items-center justify-center gap-2 px-3 text-center">
-          <button
-            type="button"
-            onClick={() => {
-              setHasDraftStrokes(false);
-              setIsEditing(true);
-            }}
-            className="inline-flex items-center gap-1.5 h-8 px-3.5 text-xs font-semibold text-slate-800 bg-white border border-slate-300 hover:border-red-700 hover:text-red-700 rounded-md shadow-2xs transition-colors"
-          >
-            <PenLine className="w-3.5 h-3.5" />
-            Tap to Sign
-          </button>
-          <span className="text-[11px] text-slate-400">
-            Locked until tapped to prevent accidental marks
-          </span>
+          {readOnly ? (
+            <span className="text-xs text-slate-400 italic">
+              Signature pending (view-only)
+            </span>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  setHasDraftStrokes(false);
+                  setIsEditing(true);
+                }}
+                className="inline-flex items-center gap-1.5 h-8 px-3.5 text-xs font-semibold text-slate-800 bg-white border border-slate-300 hover:border-red-700 hover:text-red-700 rounded-md shadow-2xs transition-colors"
+              >
+                <PenLine className="w-3.5 h-3.5" />
+                Tap to Sign
+              </button>
+              <span className="text-[11px] text-slate-400">
+                Locked until tapped to prevent accidental marks
+              </span>
+            </>
+          )}
         </div>
       )}
 
@@ -267,11 +277,12 @@ export function SignaturePad({
           <input
             type="text"
             value={value.printedName}
+            disabled={readOnly}
             onChange={(e) =>
               onChange({ ...value, printedName: e.target.value })
             }
             placeholder="Full name"
-            className="w-full h-9 px-2.5 text-sm bg-white border border-slate-300 rounded-md text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700 transition-colors"
+            className="w-full h-9 px-2.5 text-sm bg-white disabled:bg-slate-50 disabled:text-slate-600 border border-slate-300 rounded-md text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700 transition-colors"
           />
         </label>
         <label className="block">
@@ -281,8 +292,9 @@ export function SignaturePad({
           <input
             type="date"
             value={value.date}
+            disabled={readOnly}
             onChange={(e) => onChange({ ...value, date: e.target.value })}
-            className="w-full h-9 px-2.5 text-sm bg-white border border-slate-300 rounded-md text-slate-900 tabular-nums focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700 transition-colors"
+            className="w-full h-9 px-2.5 text-sm bg-white disabled:bg-slate-50 disabled:text-slate-600 border border-slate-300 rounded-md text-slate-900 tabular-nums focus:outline-none focus:ring-2 focus:ring-red-700/20 focus:border-red-700 transition-colors"
           />
         </label>
       </div>

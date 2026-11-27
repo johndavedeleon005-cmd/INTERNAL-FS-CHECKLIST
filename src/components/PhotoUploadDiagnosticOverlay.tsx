@@ -111,7 +111,7 @@ export function PhotoUploadDiagnosticOverlay({
               Photo Upload Diagnostics ({diagnostics.length})
             </h2>
             <p className="text-[11px] text-red-800/80 truncate">
-              Firebase Storage &amp; Firestore error codes &amp; attempt traces
+              Cloud Firestore photo sync error codes &amp; attempt traces
             </p>
           </div>
         </div>

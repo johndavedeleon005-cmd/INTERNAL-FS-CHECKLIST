@@ -2,7 +2,7 @@
   "entities": {
     "InspectionReport": {
       "title": "InspectionReport",
-      "description": "An IQAF-005 Store Inspection Checklist report owned by an authenticated inspector, editable anytime.",
+      "description": "An IQAF-005 Store Inspection Checklist report supporting incremental cloud autosave, version tracking, collaborator email sharing, and shareable links.",
       "type": "object",
       "properties": {
         "ownerId": {
@@ -10,6 +10,11 @@
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$",
           "description": "UID of the authenticated inspector who owns this report."
+        },
+        "ownerName": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Display name of the report owner shown to collaborators."
         },
         "documentationNo": {
           "type": "string",
@@ -31,10 +36,19 @@
           "maxLength": 200,
           "description": "Store branch or facility name."
         },
+        "reportSequence": {
+          "type": "integer",
+          "description": "Auto-incremented per-branch, per-year report sequence number (1..99999) used in INSPLND-BRANCH-YY-NNN."
+        },
         "timeOfInspection": {
           "type": "string",
           "maxLength": 20,
-          "description": "Inspection time in HH:MM format."
+          "description": "Inspection start time in HH:MM format."
+        },
+        "timeOfInspectionEnded": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Optional time when the inspection ended in HH:MM format."
         },
         "inspectedBy": {
           "type": "string",
@@ -43,15 +57,60 @@
         },
         "responses": {
           "type": "object",
-          "description": "Map of checklist item number strings ('1'-'67') to compliance status, deviation, and corrective action."
+          "description": "Map of checklist item number strings ('1'-'70') to compliance status, deviation, and corrective action."
         },
         "signOffs": {
           "type": "object",
-          "description": "Map of performedBy, acknowledgedBy, and notedBy sign-off entries including printedName, date, and signatureDataUrl."
+          "description": "Map of performedBy, acknowledgedBy, notedBy, reviewedBy, and approvedBy sign-off entries including printedName, date, and signatureDataUrl."
         },
         "stats": {
           "type": "object",
           "description": "Denormalized summary counts (answered, yes, no, na, photoCount) for fast report listing."
+        },
+        "photoIds": {
+          "type": "array",
+          "description": "Bounded list (max 250) of photo document IDs in the photos subcollection so shared collaborators can fetch photos via Master Gate without list queries."
+        },
+        "sharedWithEmails": {
+          "type": "array",
+          "description": "Bounded list (max 25) of lowercase Google account emails granted viewer or editor access."
+        },
+        "editorEmails": {
+          "type": "array",
+          "description": "Bounded list (max 25) of lowercase Google account emails granted collaborative edit access."
+        },
+        "activeShareLinkId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Optional active share link ID from /shareLinks/{shareId}, or empty/null when disabled."
+        },
+        "activeShareRole": {
+          "type": "string",
+          "enum": ["none", "viewer", "editor"],
+          "maxLength": 10,
+          "description": "Role granted to verified users who claim activeShareLinkId."
+        },
+        "lastClaimedShareLinkId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Token echoed during share-link claim to prove knowledge of activeShareLinkId."
+        },
+        "syncVersion": {
+          "type": "integer",
+          "description": "Monotonically increasing save revision counter (1..1000000) for conflict detection."
+        },
+        "lastEditedByUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the user who performed the most recent save."
+        },
+        "lastEditedByName": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Display name of the user who performed the most recent save."
         },
         "createdAt": {
           "type": "string",
@@ -88,7 +147,13 @@
           "type": "string",
           "maxLength": 128,
           "pattern": "^[a-zA-Z0-9_\\-]+$",
-          "description": "UID of the report owner."
+          "description": "UID of the parent report owner."
+        },
+        "uploadedByUid": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the authenticated user (owner or editor) who uploaded this photo."
         },
         "reportId": {
           "type": "string",
@@ -98,7 +163,7 @@
         },
         "itemNumber": {
           "type": "integer",
-          "description": "Checklist item number from 1 to 67."
+          "description": "Checklist item number from 1 to 70."
         },
         "sectionCode": {
           "type": "string",
@@ -148,8 +213,8 @@
         },
         "dataUrl": {
           "type": "string",
-          "maxLength": 600000,
-          "description": "Compressed JPEG base64 data URL (strictly bounded <= 600KB)."
+          "maxLength": 920000,
+          "description": "Compressed JPEG base64 data URL (supports HD uploads strictly bounded <= 920 KB within the 1 MiB document cap)."
         },
         "capturedAt": {
           "type": "string",
@@ -185,6 +250,81 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "ShareLink": {
+      "title": "ShareLink",
+      "description": "An unguessable capability link created by a report owner to grant verified signed-in recipients viewer or editor access without exposing collaborator emails.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "UID of the report owner who created the share link."
+        },
+        "ownerName": {
+          "type": "string",
+          "maxLength": 160,
+          "description": "Display name of the report owner."
+        },
+        "reportId": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$",
+          "description": "Target InspectionReport document ID."
+        },
+        "documentationNo": {
+          "type": "string",
+          "maxLength": 40,
+          "description": "Form documentation number for link preview."
+        },
+        "storeLocation": {
+          "type": "string",
+          "maxLength": 200,
+          "description": "Store location for link preview."
+        },
+        "dateOfInspection": {
+          "type": "string",
+          "maxLength": 20,
+          "description": "Inspection date for link preview."
+        },
+        "reportSequence": {
+          "type": "integer",
+          "description": "Optional per-branch, per-year report sequence number (1..99999) for link preview."
+        },
+        "role": {
+          "type": "string",
+          "enum": ["viewer", "editor"],
+          "maxLength": 10,
+          "description": "Access level granted when a verified user claims this link."
+        },
+        "active": {
+          "type": "boolean",
+          "description": "Whether this share link is currently active (false = revoked)."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the share link was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp when the share link was last updated."
+        }
+      },
+      "required": [
+        "ownerId",
+        "ownerName",
+        "reportId",
+        "documentationNo",
+        "storeLocation",
+        "dateOfInspection",
+        "role",
+        "active",
+        "createdAt",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -192,13 +332,19 @@
       "schema": {
         "$ref": "#/entities/InspectionReport"
       },
-      "description": "Stores IQAF-005 Store Inspection Checklist reports owned by authenticated inspectors."
+      "description": "Stores IQAF-005 Store Inspection Checklist reports with incremental sync versioning and collaborator sharing."
     },
     "/reports/{reportId}/photos/{photoId}": {
       "schema": {
         "$ref": "#/entities/InspectionPhoto"
       },
       "description": "Stores individual compressed photo proof documents belonging to a parent inspection report."
+    },
+    "/shareLinks/{shareId}": {
+      "schema": {
+        "$ref": "#/entities/ShareLink"
+      },
+      "description": "Stores revocable shareable link tokens granting verified users viewer or editor access to an inspection report."
     }
   }
 }

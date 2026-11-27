@@ -6,9 +6,13 @@ import {
   FORM_REVISION_NO,
   HOW_TO_FILL_INSTRUCTION,
   IQAF_BASIS_STATEMENT,
+  REPORT_CONFIDENTIALITY_NOTICE,
+  TOTAL_ITEMS_COUNT,
   formatDisplayDate,
-  formatDisplayTime,
+  formatInspectionTimeRange,
   formatReportNo,
+  getInspectionShortYear,
+  normalizeReportSequence,
 } from '../data/checklistData';
 import type { InspectionReport } from '../types/inspection';
 import { formatTakenTimestamp } from './imageUtils';
@@ -60,14 +64,18 @@ export async function exportInspectionToExcel(
   const revNo = report.meta.revisionNo || FORM_REVISION_NO;
   const reportNo = formatReportNo(
     report.meta.storeLocation,
-    report.meta.dateOfInspection
+    report.meta.dateOfInspection,
+    report.meta.reportSequence
   );
   const displayDate =
     formatDisplayDate(report.meta.dateOfInspection) ||
     report.meta.dateOfInspection ||
     '';
   const displayTime =
-    formatDisplayTime(report.meta.timeOfInspection) ||
+    formatInspectionTimeRange(
+      report.meta.timeOfInspection,
+      report.meta.timeOfInspectionEnded
+    ) ||
     report.meta.timeOfInspection ||
     '';
   const exportedAt = formatTakenTimestamp(new Date().toISOString());
@@ -158,6 +166,16 @@ export async function exportInspectionToExcel(
       section: 'Noted By',
       role: 'Area Manager',
       entry: report.signOffs.notedBy,
+    },
+    {
+      section: 'Reviewed By',
+      role: 'Learning and Development Manager',
+      entry: report.signOffs.reviewedBy,
+    },
+    {
+      section: 'Approved By',
+      role: 'Quality Assurance Specialist / FSCO',
+      entry: report.signOffs.approvedBy,
     },
   ];
 
@@ -271,6 +289,7 @@ export async function exportInspectionToExcel(
     '',
     `Basis: ${docNo} Store Inspection Checklist (Rev. ${revNo})`,
   ]);
+  summaryAoa.push([REPORT_CONFIDENTIALITY_NOTICE]);
 
   const wsSummary = XLSX.utils.aoa_to_sheet(summaryAoa);
 
@@ -380,7 +399,7 @@ export async function exportInspectionToExcel(
   // SHEET 2: INSPECTION CHECKLIST (All 67 Items — Filter & Pivot Ready)
   // =========================================================================
   const checklistAoa: (string | number)[][] = [
-    ['STORE INSPECTION CHECKLIST (67 COMPLIANCE ITEMS)'],
+    [`STORE INSPECTION CHECKLIST (${TOTAL_ITEMS_COUNT} COMPLIANCE ITEMS)`],
     [IQAF_BASIS_STATEMENT],
     [HOW_TO_FILL_INSTRUCTION],
     [],
@@ -438,6 +457,7 @@ export async function exportInspectionToExcel(
     '',
     `Basis: ${docNo} Store Inspection Checklist (Rev. ${revNo})`,
   ]);
+  checklistAoa.push([REPORT_CONFIDENTIALITY_NOTICE]);
 
   const wsChecklist = XLSX.utils.aoa_to_sheet(checklistAoa);
   wsChecklist['!autofilter'] = {
@@ -529,6 +549,7 @@ export async function exportInspectionToExcel(
     '',
     `Basis: ${docNo} Store Inspection Checklist (Rev. ${revNo})`,
   ]);
+  capaAoa.push([REPORT_CONFIDENTIALITY_NOTICE]);
 
   const wsCapa = XLSX.utils.aoa_to_sheet(capaAoa);
   if (deviationCount > 0) {
@@ -609,6 +630,24 @@ export async function exportInspectionToExcel(
   const photosLastRow = photosAoa.length;
 
   photosAoa.push([]);
+  photosAoa.push(['SIGN-OFF & VERIFICATION']);
+  photosAoa.push([
+    'Sign-Off Role',
+    'Designation',
+    'Printed Name',
+    'Date',
+    'Signature Status',
+  ]);
+  for (const s of signOffRows) {
+    photosAoa.push([
+      s.section,
+      s.role,
+      s.entry.printedName || '',
+      s.entry.date ? formatDisplayDate(s.entry.date) : '',
+      s.entry.signatureDataUrl ? 'Signed' : 'Pending',
+    ]);
+  }
+  photosAoa.push([]);
   photosAoa.push([
     `Report No.: ${reportNo}`,
     '',
@@ -616,6 +655,7 @@ export async function exportInspectionToExcel(
     '',
     `Basis: ${docNo} Store Inspection Checklist (Rev. ${revNo})`,
   ]);
+  photosAoa.push([REPORT_CONFIDENTIALITY_NOTICE]);
 
   const wsPhotos = XLSX.utils.aoa_to_sheet(photosAoa);
   if (indexedPhotos.length > 0) {
@@ -650,8 +690,138 @@ export async function exportInspectionToExcel(
   });
   const url = URL.createObjectURL(blob);
   const storePart = sanitizeFilePart(report.meta.storeLocation, 'BRANCH');
-  const datePart = sanitizeFilePart(report.meta.dateOfInspection, 'DATE');
-  const fileName = `INSPLND-${storePart}-${datePart}.xlsx`;
+  const yearPart = getInspectionShortYear(report.meta.dateOfInspection);
+  const seqPart = String(normalizeReportSequence(report.meta.reportSequence)).padStart(3, '0');
+  const fileName = `INSPLND-${storePart}-${yearPart}-${seqPart}.xlsx`;
+
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = fileName;
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+/**
+ * Exports a single-sheet Excel (.xlsx) Store Inspection Checklist template
+ * with zero filled-in inspection data, ready for blank/offline auditing.
+ */
+export async function exportBlankChecklistExcel(): Promise<void> {
+  const wb = XLSX.utils.book_new();
+  const docNo = FORM_DOCUMENTATION_NO;
+  const revNo = FORM_REVISION_NO;
+
+  const checklistAoa: (string | number)[][] = [
+    [`STORE INSPECTION CHECKLIST (${TOTAL_ITEMS_COUNT} COMPLIANCE ITEMS)`],
+    [IQAF_BASIS_STATEMENT],
+    [HOW_TO_FILL_INSTRUCTION],
+    [],
+    ['Report No.:', '', '', 'Basis Form #:', `${docNo} (Rev. ${revNo})`],
+    ['Store Location:', '', '', 'Date of Inspection:', ''],
+    ['Inspected By:', '', '', 'Time of Inspection:', ''],
+    [],
+    [
+      'Item No.',
+      'Section',
+      'Category',
+      'Inspection Item',
+      'Complied? (Yes / No / N/A)',
+      'Deviation / Findings',
+      'Corrective Action',
+    ],
+  ];
+
+  const headerRow = checklistAoa.length;
+  for (const section of CHECKLIST_SECTIONS) {
+    for (const item of section.items) {
+      checklistAoa.push([
+        item.number,
+        section.code,
+        section.title,
+        item.text,
+        '',
+        '',
+        '',
+      ]);
+    }
+  }
+  const lastItemRow = checklistAoa.length;
+
+  checklistAoa.push([]);
+  checklistAoa.push(['SIGN-OFF & VERIFICATION']);
+  checklistAoa.push([
+    'Sign-Off Role',
+    'Designation',
+    'Printed Name',
+    'Date',
+    'Signature',
+  ]);
+  checklistAoa.push([
+    'Performed By',
+    'Food Safety Compliance Officer',
+    '',
+    '',
+    '',
+  ]);
+  checklistAoa.push([
+    'Acknowledged By',
+    'Restaurant / Shift Manager',
+    '',
+    '',
+    '',
+  ]);
+  checklistAoa.push(['Noted By', 'Area Manager', '', '', '']);
+  checklistAoa.push([
+    'Reviewed By',
+    'Learning and Development Manager',
+    '',
+    '',
+    '',
+  ]);
+  checklistAoa.push([
+    'Approved By',
+    'Quality Assurance Specialist / FSCO',
+    '',
+    '',
+    '',
+  ]);
+  checklistAoa.push([]);
+  checklistAoa.push([
+    'Report No.:',
+    '',
+    '',
+    `Basis: ${docNo} Store Inspection Checklist (Rev. ${revNo})`,
+  ]);
+  checklistAoa.push([REPORT_CONFIDENTIALITY_NOTICE]);
+
+  const wsChecklist = XLSX.utils.aoa_to_sheet(checklistAoa);
+  wsChecklist['!autofilter'] = {
+    ref: `A${headerRow}:G${lastItemRow}`,
+  };
+  wsChecklist['!merges'] = [
+    { s: { r: 0, c: 0 }, e: { r: 0, c: 6 } },
+    { s: { r: 1, c: 0 }, e: { r: 1, c: 6 } },
+    { s: { r: 2, c: 0 }, e: { r: 2, c: 6 } },
+  ];
+  wsChecklist['!cols'] = [
+    { wch: 10 },
+    { wch: 10 },
+    { wch: 30 },
+    { wch: 56 },
+    { wch: 24 },
+    { wch: 36 },
+    { wch: 36 },
+  ];
+
+  XLSX.utils.book_append_sheet(wb, wsChecklist, 'Inspection Checklist');
+
+  const outBuffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' });
+  const blob = new Blob([outBuffer], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const url = URL.createObjectURL(blob);
+  const fileName = `${sanitizeFilePart(docNo, 'IQAF-005')}-Blank-Checklist.xlsx`;
 
   const link = document.createElement('a');
   link.href = url;

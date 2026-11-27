@@ -1,13 +1,19 @@
-import jsPDF from 'jspdf';
+import jsPDF, { GState } from 'jspdf';
 import autoTable from 'jspdf-autotable';
 import {
   ALL_CHECKLIST_ITEMS,
   CHECKLIST_SECTIONS,
+  FORM_DOCUMENTATION_NO,
+  FORM_REVISION_NO,
   HOW_TO_FILL_INSTRUCTION,
   IQAF_BASIS_STATEMENT,
+  REPORT_CONFIDENTIALITY_NOTICE,
+  createEmptyResponse,
   formatDisplayDate,
-  formatDisplayTime,
+  formatInspectionTimeRange,
   formatReportNo,
+  getInspectionShortYear,
+  normalizeReportSequence,
 } from '../data/checklistData';
 import type {
   InspectionReport,
@@ -69,20 +75,28 @@ function sanitizeFilePart(value: string, fallback: string): string {
   return cleaned || fallback;
 }
 
-export async function exportInspectionToPdf(
+type LogoAsset = { dataUrl: string; width: number; height: number } | null;
+
+interface RenderedReportSegment {
+  startPage: number;
+  endPage: number;
+  reportNo: string;
+  docNo: string;
+}
+
+async function renderReportIntoPdf(
+  doc: jsPDF,
   report: InspectionReport,
-  options: PdfExportOptions = {
-    includeSummary: true,
-    includePhotoAppendix: true,
-    includeInlineThumbnails: false,
+  options: PdfExportOptions,
+  logoAsset: LogoAsset,
+  extra?: { blankTemplate?: boolean; isFirstReport?: boolean }
+): Promise<RenderedReportSegment> {
+  const isBlankTemplate = Boolean(extra?.blankTemplate);
+  const isFirstReport = extra?.isFirstReport !== false;
+  if (!isFirstReport) {
+    doc.addPage();
   }
-): Promise<void> {
-  const doc = new jsPDF({
-    orientation: 'portrait',
-    unit: 'mm',
-    format: 'letter',
-    compress: true,
-  });
+  const startPage = doc.getNumberOfPages();
 
   const pageWidth = doc.internal.pageSize.getWidth(); // 215.9mm
   const pageHeight = doc.internal.pageSize.getHeight(); // 279.4mm
@@ -90,10 +104,11 @@ export async function exportInspectionToPdf(
   const contentWidth = pageWidth - marginX * 2; // 190.5mm
   const reportNo = formatReportNo(
     report.meta.storeLocation,
-    report.meta.dateOfInspection
+    report.meta.dateOfInspection,
+    report.meta.reportSequence
   );
+  const docNo = report.meta.documentationNo || 'IQAF-005';
 
-  const logoAsset = await loadJiangNanLogoForPdf();
   const drawLogoInBox = (
     boxX: number,
     boxY: number,
@@ -124,7 +139,13 @@ export async function exportInspectionToPdf(
 
   // Pre-measure signature images
   const sigDims: Record<string, { width: number; height: number }> = {};
-  const signKeys = ['performedBy', 'acknowledgedBy', 'notedBy'] as const;
+  const signKeys = [
+    'performedBy',
+    'acknowledgedBy',
+    'notedBy',
+    'reviewedBy',
+    'approvedBy',
+  ] as const;
   for (const key of signKeys) {
     const url = report.signOffs[key].signatureDataUrl;
     if (url) {
@@ -201,7 +222,13 @@ export async function exportInspectionToPdf(
   const metaRows: [string, string][] = [
     ['Date of Inspection:', formatDisplayDate(report.meta.dateOfInspection)],
     ['Store Location:', report.meta.storeLocation],
-    ['Time of Inspection:', formatDisplayTime(report.meta.timeOfInspection)],
+    [
+      'Time of Inspection:',
+      formatInspectionTimeRange(
+        report.meta.timeOfInspection,
+        report.meta.timeOfInspectionEnded
+      ),
+    ],
     ['Inspected By:', report.meta.inspectedBy],
   ];
 
@@ -446,24 +473,16 @@ export async function exportInspectionToPdf(
   });
 
   // =========================================================================
-  // SIGN-OFF BLOCK (Exact Page 3 bottom layout)
+  // REUSABLE SIGN-OFF & VERIFICATION BLOCK (Exact IQAF-005 Bottom Layout)
   // =========================================================================
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const lastTableY = (doc as any).lastAutoTable?.finalY ?? cursorY;
-  let sigY = lastTableY + 6;
-  const sigBlockTotalH = 42;
+  const sigHeaderH = 5.6;
+  const sigBoxH = 16.5;
+  const sigLabelH = 8.8;
+  const sigRowH = sigHeaderH + sigBoxH + sigLabelH; // 30.9mm per row
+  const sigRowGap = 2.5;
+  const sigBlockTotalH = sigRowH * 2 + sigRowGap + 7.2; // ~71.5mm
 
-  if (sigY + sigBlockTotalH > pageHeight - 15) {
-    doc.addPage();
-    sigY = 14;
-  }
-
-  const colW = contentWidth / 3;
-  const sigHeaderH = 6.2;
-  const sigBoxH = 18.5;
-  const sigLabelH = 9.5;
-
-  const signOffCols = [
+  const primarySignOffCols = [
     {
       heading: 'Performed By',
       role: 'Food Safety Compliance Officer',
@@ -484,89 +503,126 @@ export async function exportInspectionToPdf(
     },
   ];
 
-  doc.setDrawColor(64, 64, 64);
-  doc.setLineWidth(0.22);
+  const secondarySignOffCols = [
+    {
+      heading: 'Reviewed By',
+      role: 'Learning and Development Manager',
+      entry: report.signOffs.reviewedBy,
+      key: 'reviewedBy',
+    },
+    {
+      heading: 'Approved By',
+      role: 'Quality Assurance Specialist / FSCO',
+      entry: report.signOffs.approvedBy,
+      key: 'approvedBy',
+    },
+  ];
 
-  signOffCols.forEach((col, idx) => {
-    const x = marginX + idx * colW;
+  const drawSignOffRow = (
+    cols: typeof primarySignOffCols,
+    rowTopY: number
+  ) => {
+    const rowColW = contentWidth / cols.length;
+    cols.forEach((col, idx) => {
+      const x = marginX + idx * rowColW;
 
-    // Header row
-    doc.setFillColor(217, 217, 217);
-    doc.rect(x, sigY, colW, sigHeaderH, 'FD');
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(8);
-    doc.setTextColor(17, 17, 17);
-    doc.text(col.heading, x + colW / 2, sigY + 4.3, { align: 'center' });
-
-    // Signature + printed name / date box
-    doc.setFillColor(255, 255, 255);
-    doc.rect(x, sigY + sigHeaderH, colW, sigBoxH, 'FD');
-
-    if (col.entry.signatureDataUrl) {
-      try {
-        const dims = sigDims[col.key] ?? { width: 3, height: 1 };
-        const maxSigW = colW - 14;
-        const maxSigH = 11;
-        const scale = Math.min(maxSigW / dims.width, maxSigH / dims.height);
-        const drawW = dims.width * scale;
-        const drawH = dims.height * scale;
-        const sx = x + (colW - drawW) / 2;
-        const sy = sigY + sigHeaderH + 1.5 + (maxSigH - drawH) / 2;
-        doc.addImage(col.entry.signatureDataUrl, 'PNG', sx, sy, drawW, drawH);
-      } catch {
-        // Skip invalid signature image
-      }
-    }
-
-    const nameDateLine = [
-      col.entry.printedName?.trim(),
-      col.entry.date ? formatDisplayDate(col.entry.date) : '',
-    ]
-      .filter(Boolean)
-      .join('  /  ');
-
-    if (nameDateLine) {
+      // Header row
+      doc.setFillColor(217, 217, 217);
+      doc.rect(x, rowTopY, rowColW, sigHeaderH, 'FD');
       doc.setFont('helvetica', 'bold');
-      doc.setFontSize(7.5);
+      doc.setFontSize(8);
       doc.setTextColor(17, 17, 17);
-      doc.text(nameDateLine, x + colW / 2, sigY + sigHeaderH + sigBoxH - 2.2, {
+      doc.text(col.heading, x + rowColW / 2, rowTopY + 3.9, { align: 'center' });
+
+      // Signature + printed name / date box
+      doc.setFillColor(255, 255, 255);
+      doc.rect(x, rowTopY + sigHeaderH, rowColW, sigBoxH, 'FD');
+
+      if (col.entry.signatureDataUrl) {
+        try {
+          const dims = sigDims[col.key] ?? { width: 3, height: 1 };
+          const maxSigW = rowColW - 14;
+          const maxSigH = 10;
+          const scale = Math.min(maxSigW / dims.width, maxSigH / dims.height);
+          const drawW = dims.width * scale;
+          const drawH = dims.height * scale;
+          const sx = x + (rowColW - drawW) / 2;
+          const syImg = rowTopY + sigHeaderH + 1.2 + (maxSigH - drawH) / 2;
+          doc.addImage(col.entry.signatureDataUrl, 'PNG', sx, syImg, drawW, drawH);
+        } catch {
+          // Skip invalid signature image
+        }
+      }
+
+      const nameDateLine = [
+        col.entry.printedName?.trim(),
+        col.entry.date ? formatDisplayDate(col.entry.date) : '',
+      ]
+        .filter(Boolean)
+        .join('  /  ');
+
+      if (nameDateLine) {
+        doc.setFont('helvetica', 'bold');
+        doc.setFontSize(7.5);
+        doc.setTextColor(17, 17, 17);
+        doc.text(nameDateLine, x + rowColW / 2, rowTopY + sigHeaderH + sigBoxH - 2.0, {
+          align: 'center',
+          maxWidth: rowColW - 4,
+        });
+      }
+
+      // Role subtitle cell
+      doc.setFillColor(255, 255, 255);
+      doc.rect(x, rowTopY + sigHeaderH + sigBoxH, rowColW, sigLabelH, 'FD');
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(7.2);
+      doc.setTextColor(17, 17, 17);
+      doc.text(col.role, x + rowColW / 2, rowTopY + sigHeaderH + sigBoxH + 3.5, {
         align: 'center',
-        maxWidth: colW - 4,
+        maxWidth: rowColW - 3,
       });
+      doc.text(
+        'Signature over printed name / Date',
+        x + rowColW / 2,
+        rowTopY + sigHeaderH + sigBoxH + 7.0,
+        { align: 'center', maxWidth: rowColW - 3 }
+      );
+    });
+  };
+
+  const drawSignOffBlock = (startY: number) => {
+    let sigY = startY;
+    if (sigY + sigBlockTotalH > pageHeight - 14) {
+      doc.addPage();
+      sigY = 14;
     }
 
-    // Role subtitle cell
-    doc.setFillColor(255, 255, 255);
-    doc.rect(x, sigY + sigHeaderH + sigBoxH, colW, sigLabelH, 'FD');
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(7.2);
+    doc.setDrawColor(64, 64, 64);
+    doc.setLineWidth(0.22);
+
+    drawSignOffRow(primarySignOffCols, sigY);
+    drawSignOffRow(secondarySignOffCols, sigY + sigRowH + sigRowGap);
+
+    // Department & Basis Form # line directly beneath sign-off tables
+    const deptY = sigY + sigRowH * 2 + sigRowGap + 5.0;
+    doc.setFont('helvetica', 'bold');
+    doc.setFontSize(7.5);
     doc.setTextColor(17, 17, 17);
-    doc.text(col.role, x + colW / 2, sigY + sigHeaderH + sigBoxH + 3.8, {
-      align: 'center',
-      maxWidth: colW - 3,
-    });
+    doc.text('Quality Assurance Department', marginX, deptY);
+
+    doc.setFont('helvetica', 'normal');
     doc.text(
-      'Signature over printed name / Date',
-      x + colW / 2,
-      sigY + sigHeaderH + sigBoxH + 7.4,
-      { align: 'center', maxWidth: colW - 3 }
+      `Basis Form #: ${report.meta.documentationNo || 'IQAF-005'}   Revision No.: ${report.meta.revisionNo || '0'}`,
+      marginX + contentWidth / 2,
+      deptY,
+      { align: 'center' }
     );
-  });
+  };
 
-  // Department & Basis Form # line directly beneath sign-off table
-  const deptY = sigY + sigHeaderH + sigBoxH + sigLabelH + 5.5;
-  doc.setFont('helvetica', 'bold');
-  doc.setFontSize(7.5);
-  doc.setTextColor(17, 17, 17);
-  doc.text('Quality Assurance Department', marginX, deptY);
-
-  doc.setFont('helvetica', 'normal');
-  doc.text(
-    `Basis Form #: ${report.meta.documentationNo || 'IQAF-005'}   Revision No.: ${report.meta.revisionNo || '0'}`,
-    marginX + contentWidth / 2,
-    deptY,
-    { align: 'center' }
-  );
+  // Sign-off block at bottom of main Store Inspection Checklist
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const lastTableY = (doc as any).lastAutoTable?.finalY ?? cursorY;
+  drawSignOffBlock(lastTableY + 6);
 
   // =========================================================================
   // INSPECTION SUMMARY SHEET (Exact IQAF-005 Table Styling)
@@ -885,6 +941,11 @@ export async function exportInspectionToPdf(
       showHead: 'everyPage',
       rowPageBreak: 'avoid',
     });
+
+    // Sign-off & Verification block at bottom of Store Inspection Summary
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const afterSummaryY = ((doc as any).lastAutoTable?.finalY ?? afterCatY) + 6;
+    drawSignOffBlock(afterSummaryY);
   }
 
   // =========================================================================
@@ -894,14 +955,22 @@ export async function exportInspectionToPdf(
     const cardsPerRow = 2;
     const cardsPerPage = 4;
     const cardGapX = 5.5;
-    const cardGapY = 6;
     const cardW = (contentWidth - cardGapX) / cardsPerRow; // 92.5mm
-    const cardH = 104;
 
     const totalAppendixPages = Math.ceil(indexedPhotos.length / cardsPerPage);
 
     for (let pageIdx = 0; pageIdx < totalAppendixPages; pageIdx++) {
       doc.addPage();
+      const isLastAppendixPage = pageIdx === totalAppendixPages - 1;
+      const slice = indexedPhotos.slice(
+        pageIdx * cardsPerPage,
+        (pageIdx + 1) * cardsPerPage
+      );
+      const compactForSignOff = isLastAppendixPage && slice.length > 2;
+      const cardGapY = compactForSignOff ? 4.5 : 6;
+      const cardH = compactForSignOff ? 92 : 104;
+      const imgBoxH = compactForSignOff ? 50 : 61;
+
       let ay = 10.5;
 
       // Matching IQAF-005 header strip for Appendix pages
@@ -961,18 +1030,16 @@ export async function exportInspectionToPdf(
         ay + 10.8
       );
 
-      ay += 18;
+      ay += compactForSignOff ? 16 : 18;
 
-      const slice = indexedPhotos.slice(
-        pageIdx * cardsPerPage,
-        (pageIdx + 1) * cardsPerPage
-      );
+      let maxCardBottomY = ay;
 
       slice.forEach((entry, localIdx) => {
         const col = localIdx % cardsPerRow;
         const row = Math.floor(localIdx / cardsPerRow);
         const cx = marginX + col * (cardW + cardGapX);
         const cy = ay + row * (cardH + cardGapY);
+        maxCardBottomY = Math.max(maxCardBottomY, cy + cardH);
 
         // Outer card border
         doc.setDrawColor(64, 64, 64);
@@ -1005,11 +1072,10 @@ export async function exportInspectionToPdf(
         doc.text(statusLabel, cx + cardW - 2.2, cy + 4.8, { align: 'right' });
 
         // Photo viewport box
-        const imgPad = 2.5;
+        const imgPad = 2.2;
         const imgBoxX = cx + imgPad;
         const imgBoxY = cy + barH + imgPad;
         const imgBoxW = cardW - imgPad * 2;
-        const imgBoxH = 61;
 
         doc.setFillColor(248, 250, 252);
         doc.setDrawColor(203, 213, 225);
@@ -1042,11 +1108,12 @@ export async function exportInspectionToPdf(
         }
 
         // Metadata details below image
-        let textY = imgBoxY + imgBoxH + 4.2;
+        let textY = imgBoxY + imgBoxH + 3.8;
         const maxTextW = cardW - 4.8;
+        const cardTextBottomLimit = cy + cardH - 5.5;
 
         doc.setFont('helvetica', 'bold');
-        doc.setFontSize(7.2);
+        doc.setFontSize(7.1);
         doc.setTextColor(17, 17, 17);
         const itemLines = doc
           .splitTextToSize(
@@ -1055,26 +1122,26 @@ export async function exportInspectionToPdf(
           )
           .slice(0, 2);
         doc.text(itemLines, cx + 2.4, textY);
-        textY += itemLines.length * 3.2 + 1.2;
+        textY += itemLines.length * 3.1 + 1.0;
 
-        if (entry.photo.caption.trim()) {
+        if (entry.photo.caption.trim() && textY < cardTextBottomLimit) {
           doc.setFont('helvetica', 'normal');
-          doc.setFontSize(7.2);
+          doc.setFontSize(7.0);
           doc.setTextColor(34, 34, 34);
           const capLines = doc
             .splitTextToSize(`Caption: ${entry.photo.caption.trim()}`, maxTextW)
-            .slice(0, 2);
+            .slice(0, compactForSignOff ? 1 : 2);
           doc.text(capLines, cx + 2.4, textY);
-          textY += capLines.length * 3.1 + 1;
+          textY += capLines.length * 3.0 + 0.8;
         }
 
-        if (entry.deviation.trim()) {
+        if (entry.deviation.trim() && textY < cardTextBottomLimit) {
           doc.setFont('helvetica', 'italic');
-          doc.setFontSize(7);
+          doc.setFontSize(6.9);
           doc.setTextColor(71, 85, 105);
           const devLines = doc
             .splitTextToSize(`Finding: ${entry.deviation.trim()}`, maxTextW)
-            .slice(0, 2);
+            .slice(0, compactForSignOff ? 1 : 2);
           doc.text(devLines, cx + 2.4, textY);
         }
 
@@ -1087,43 +1154,282 @@ export async function exportInspectionToPdf(
           : '';
         doc.text(capturedLabel, cx + 2.4, cy + cardH - 2.2);
       });
+
+      if (isLastAppendixPage) {
+        drawSignOffBlock(maxCardBottomY + (compactForSignOff ? 5 : 6));
+      }
     }
   }
 
-  // =========================================================================
-  // EVERY-PAGE FOOTER: Automatic Report No. + IQAF-005 Basis + Page X of Y
-  // =========================================================================
-  const totalPages = doc.getNumberOfPages();
-  const docNo = report.meta.documentationNo || 'IQAF-005';
-  for (let p = 1; p <= totalPages; p++) {
-    doc.setPage(p);
-    doc.setDrawColor(190, 195, 204);
-    doc.setLineWidth(0.18);
-    doc.line(marginX, pageHeight - 11.4, pageWidth - marginX, pageHeight - 11.4);
+  const endPage = doc.getNumberOfPages();
+  return {
+    startPage,
+    endPage,
+    reportNo: isBlankTemplate ? '____________________________' : reportNo,
+    docNo,
+  };
+}
 
-    doc.setFont('helvetica', 'bold');
-    doc.setFontSize(7.1);
-    doc.setTextColor(17, 17, 17);
-    doc.text(`Report No.: ${reportNo}`, marginX, pageHeight - 7.5, {
-      maxWidth: contentWidth - 76,
-    });
+function drawCenteredRotatedWatermarkText(
+  doc: jsPDF,
+  text: string,
+  centerX: number,
+  centerY: number,
+  angleDeg: number,
+  fontSizePt: number
+): void {
+  doc.setFontSize(fontSizePt);
+  const textWidthMm = doc.getTextWidth(text);
+  const capHeightMm = fontSizePt * 0.352778 * 0.72;
+  const rad = (angleDeg * Math.PI) / 180;
+  const x =
+    centerX -
+    (textWidthMm / 2) * Math.cos(rad) +
+    (capHeightMm / 2) * Math.sin(rad);
+  const y =
+    centerY +
+    (textWidthMm / 2) * Math.sin(rad) +
+    (capHeightMm / 2) * Math.cos(rad);
+  doc.text(text, x, y, { angle: angleDeg });
+}
 
-    doc.setFont('helvetica', 'normal');
-    doc.setFontSize(7.1);
-    doc.setTextColor(51, 65, 85);
-    doc.text(
-      `Basis: ${docNo} Store Inspection Checklist | Page ${p} of ${totalPages}`,
-      pageWidth - marginX,
-      pageHeight - 7.5,
-      { align: 'right' }
-    );
+function drawPageConfidentialWatermark(
+  doc: jsPDF,
+  pageWidth: number,
+  pageHeight: number,
+  subtitle?: string
+): void {
+  const angleDeg = 45;
+  const rad = (angleDeg * Math.PI) / 180;
+  const centerX = pageWidth / 2;
+  const centerY = pageHeight / 2;
+
+  doc.saveGraphicsState();
+  doc.setGState(new GState({ opacity: 0.11 }));
+  doc.setFont('helvetica', 'bold');
+  doc.setTextColor(185, 28, 28);
+  drawCenteredRotatedWatermarkText(doc, 'CONFIDENTIAL', centerX, centerY, angleDeg, 54);
+
+  if (subtitle) {
+    const offsetMm = 12;
+    const subCenterX = centerX + offsetMm * Math.sin(rad);
+    const subCenterY = centerY + offsetMm * Math.cos(rad);
+    doc.setTextColor(71, 85, 105);
+    drawCenteredRotatedWatermarkText(doc, subtitle, subCenterX, subCenterY, angleDeg, 10);
   }
+
+  doc.restoreGraphicsState();
+}
+
+function drawDocumentFooters(
+  doc: jsPDF,
+  segments: RenderedReportSegment[],
+  options?: {
+    isBlankTemplate?: boolean;
+    includeConfidentialWatermark?: boolean;
+  }
+): number {
+  const pageWidth = doc.internal.pageSize.getWidth();
+  const pageHeight = doc.internal.pageSize.getHeight();
+  const marginX = 11;
+  const contentWidth = pageWidth - marginX * 2;
+  const totalPages = doc.getNumberOfPages();
+  const isMerged = segments.length > 1;
+  const shouldWatermark = options?.includeConfidentialWatermark !== false;
+
+  segments.forEach((seg, segIndex) => {
+    const segPageCount = seg.endPage - seg.startPage + 1;
+    const watermarkSubtitle = options?.isBlankTemplate
+      ? 'INTERNAL USE ONLY'
+      : `${seg.reportNo}  ·  INTERNAL USE ONLY`;
+
+    for (let p = seg.startPage; p <= seg.endPage; p++) {
+      doc.setPage(p);
+
+      if (shouldWatermark) {
+        drawPageConfidentialWatermark(
+          doc,
+          pageWidth,
+          pageHeight,
+          watermarkSubtitle
+        );
+      }
+
+      doc.setDrawColor(190, 195, 204);
+      doc.setLineWidth(0.18);
+      doc.line(marginX, pageHeight - 12.5, pageWidth - marginX, pageHeight - 12.5);
+
+      doc.setFont('helvetica', 'bold');
+      doc.setFontSize(7.0);
+      doc.setTextColor(17, 17, 17);
+      const footerReportText = options?.isBlankTemplate
+        ? 'Report No.: ____________________________'
+        : `Report No.: ${seg.reportNo}`;
+      doc.text(footerReportText, marginX, pageHeight - 9.0, {
+        maxWidth: contentWidth - 76,
+      });
+
+      doc.setFont('helvetica', 'normal');
+      doc.setFontSize(7.0);
+      doc.setTextColor(51, 65, 85);
+      const rightLabel = isMerged
+        ? `Report ${segIndex + 1}/${segments.length} (p.${p - seg.startPage + 1}/${segPageCount}) | Page ${p} of ${totalPages}`
+        : `Basis: ${seg.docNo} Store Inspection Checklist | Page ${p} of ${totalPages}`;
+      doc.text(rightLabel, pageWidth - marginX, pageHeight - 9.0, {
+        align: 'right',
+      });
+
+      doc.setFont('helvetica', 'italic');
+      doc.setFontSize(6.0);
+      doc.setTextColor(100, 116, 139);
+      doc.text(REPORT_CONFIDENTIALITY_NOTICE, marginX, pageHeight - 5.4, {
+        maxWidth: contentWidth,
+      });
+    }
+  });
 
   // Verify ALL_CHECKLIST_ITEMS count consistency silently
   void ALL_CHECKLIST_ITEMS;
+  return totalPages;
+}
+
+export async function exportInspectionToPdf(
+  report: InspectionReport,
+  options: PdfExportOptions = {
+    includeSummary: true,
+    includePhotoAppendix: true,
+    includeInlineThumbnails: false,
+    includeConfidentialWatermark: true,
+  },
+  extra?: { blankTemplate?: boolean }
+): Promise<void> {
+  const isBlankTemplate = Boolean(extra?.blankTemplate);
+  const doc = new jsPDF({
+    orientation: 'portrait',
+    unit: 'mm',
+    format: 'letter',
+    compress: true,
+  });
+
+  const logoAsset = await loadJiangNanLogoForPdf();
+  const segment = await renderReportIntoPdf(doc, report, options, logoAsset, {
+    blankTemplate: isBlankTemplate,
+    isFirstReport: true,
+  });
+
+  drawDocumentFooters(doc, [segment], {
+    isBlankTemplate,
+    includeConfidentialWatermark: options.includeConfidentialWatermark !== false,
+  });
+
+  if (isBlankTemplate) {
+    doc.save(`${sanitizeFilePart(segment.docNo, 'IQAF-005')}-Blank-Checklist.pdf`);
+    return;
+  }
 
   const storePart = sanitizeFilePart(report.meta.storeLocation, 'BRANCH');
-  const datePart = sanitizeFilePart(report.meta.dateOfInspection, 'DATE');
-  const fileName = `INSPLND-${storePart}-${datePart}.pdf`;
+  const yearPart = getInspectionShortYear(report.meta.dateOfInspection);
+  const seqPart = String(normalizeReportSequence(report.meta.reportSequence)).padStart(3, '0');
+  const fileName = `INSPLND-${storePart}-${yearPart}-${seqPart}.pdf`;
   doc.save(fileName);
+}
+
+/**
+ * Merges multiple InspectionReport documents sequentially into a single PDF
+ * with per-report headers, summaries, photo appendices, and continuous page numbers.
+ */
+export async function exportMergedReportsToPdf(
+  reports: InspectionReport[],
+  options: PdfExportOptions = {
+    includeSummary: true,
+    includePhotoAppendix: true,
+    includeInlineThumbnails: false,
+    includeConfidentialWatermark: true,
+  },
+  onProgress?: (current: number, total: number) => void
+): Promise<{ reportCount: number; pageCount: number }> {
+  if (reports.length === 0) {
+    return { reportCount: 0, pageCount: 0 };
+  }
+
+  const doc = new jsPDF({
+    orientation: 'portrait',
+    unit: 'mm',
+    format: 'letter',
+    compress: true,
+  });
+
+  const logoAsset = await loadJiangNanLogoForPdf();
+  const segments: RenderedReportSegment[] = [];
+
+  for (let i = 0; i < reports.length; i++) {
+    onProgress?.(i + 1, reports.length);
+    const seg = await renderReportIntoPdf(doc, reports[i], options, logoAsset, {
+      isFirstReport: i === 0,
+    });
+    segments.push(seg);
+  }
+
+  const totalPages = drawDocumentFooters(doc, segments, {
+    includeConfidentialWatermark: options.includeConfidentialWatermark !== false,
+  });
+
+  if (reports.length === 1) {
+    const single = reports[0];
+    const storePart = sanitizeFilePart(single.meta.storeLocation, 'BRANCH');
+    const yearPart = getInspectionShortYear(single.meta.dateOfInspection);
+    const seqPart = String(
+      normalizeReportSequence(single.meta.reportSequence)
+    ).padStart(3, '0');
+    doc.save(`INSPLND-${storePart}-${yearPart}-${seqPart}.pdf`);
+  } else {
+    const todayIso = new Date().toISOString().slice(0, 10);
+    doc.save(`INSPLND-Merged-${reports.length}-Reports-${todayIso}.pdf`);
+  }
+
+  return { reportCount: reports.length, pageCount: totalPages };
+}
+
+/**
+ * Downloads a completely blank, sheet-only IQAF-005 Store Inspection Checklist PDF
+ * containing no filled metadata, responses, summary sheet, or photo appendix.
+ */
+export async function exportBlankChecklistPdf(): Promise<void> {
+  const emptyResponses: InspectionReport['responses'] = {};
+  for (const item of ALL_CHECKLIST_ITEMS) {
+    emptyResponses[item.number] = createEmptyResponse();
+  }
+
+  const blankReport: InspectionReport = {
+    id: 'blank-template',
+    updatedAt: '',
+    meta: {
+      documentationNo: FORM_DOCUMENTATION_NO,
+      revisionNo: FORM_REVISION_NO,
+      dateOfInspection: '',
+      storeLocation: '',
+      timeOfInspection: '',
+      timeOfInspectionEnded: '',
+      inspectedBy: '',
+    },
+    responses: emptyResponses,
+    signOffs: {
+      performedBy: { printedName: '', date: '', signatureDataUrl: null },
+      acknowledgedBy: { printedName: '', date: '', signatureDataUrl: null },
+      notedBy: { printedName: '', date: '', signatureDataUrl: null },
+      reviewedBy: { printedName: '', date: '', signatureDataUrl: null },
+      approvedBy: { printedName: '', date: '', signatureDataUrl: null },
+    },
+  };
+
+  await exportInspectionToPdf(
+    blankReport,
+    {
+      includeSummary: false,
+      includePhotoAppendix: false,
+      includeInlineThumbnails: false,
+      includeConfidentialWatermark: false,
+    },
+    { blankTemplate: true }
+  );
 }

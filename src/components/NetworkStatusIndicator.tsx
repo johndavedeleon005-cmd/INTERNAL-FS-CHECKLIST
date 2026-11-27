@@ -12,18 +12,32 @@ import {
   WifiOff,
 } from 'lucide-react';
 
+import type { BackgroundSyncState } from '../utils/photoBackgroundSync';
+
+export interface CloudSaveErrorInfo {
+  code: string;
+  summary: string;
+  detail?: string;
+  at: string;
+}
+
 interface NetworkStatusIndicatorProps {
   isSignedIn: boolean;
   isSigningIn: boolean;
   isSavingOnline: boolean;
   hasUnsavedCloudChanges: boolean;
+  lastSaveError?: CloudSaveErrorInfo | null;
   uploadingPhotoCount: number;
   failedPhotoCount: number;
   localOnlyPhotoCount: number;
+  queuedOtherReportsPhotoCount?: number;
   totalPhotosCount: number;
   lastSyncedAt: string | null;
   autoSaveEnabled?: boolean;
   onToggleAutoSave?: (enabled: boolean) => void;
+  hdUploadsEnabled?: boolean;
+  onToggleHdUploads?: (enabled: boolean) => void;
+  backgroundSync?: BackgroundSyncState;
   onSaveOnline: () => Promise<void>;
   onRetryFailedPhotos: () => void;
   onSignIn: () => Promise<void>;
@@ -37,13 +51,18 @@ export function NetworkStatusIndicator({
   isSigningIn,
   isSavingOnline,
   hasUnsavedCloudChanges,
+  lastSaveError = null,
   uploadingPhotoCount,
   failedPhotoCount,
   localOnlyPhotoCount,
+  queuedOtherReportsPhotoCount = 0,
   totalPhotosCount,
   lastSyncedAt,
   autoSaveEnabled = true,
   onToggleAutoSave,
+  hdUploadsEnabled = true,
+  onToggleHdUploads,
+  backgroundSync,
   onSaveOnline,
   onRetryFailedPhotos,
   onSignIn,
@@ -131,10 +150,28 @@ export function NetworkStatusIndicator({
 
   const isConnected = browserOnline && serverReachable;
 
-  // Notify parent when connectivity transitions after initial state settles
+  // Poll slightly faster while disconnected so recovery auto-dismisses the offline toast promptly
+  useEffect(() => {
+    if (isConnected) return;
+    const retryId = window.setInterval(() => {
+      if (
+        document.visibilityState === 'visible' &&
+        typeof navigator !== 'undefined' &&
+        navigator.onLine
+      ) {
+        void verifyConnection();
+      }
+    }, 8000);
+    return () => window.clearInterval(retryId);
+  }, [isConnected, verifyConnection]);
+
+  // Notify parent when connectivity changes (or on initial mount if already offline)
   useEffect(() => {
     if (prevConnectedRef.current === null) {
       prevConnectedRef.current = isConnected;
+      if (!isConnected) {
+        onConnectivityChangeRef.current?.(false);
+      }
       return;
     }
     if (prevConnectedRef.current !== isConnected) {
@@ -167,9 +204,21 @@ export function NetworkStatusIndicator({
     };
   }, [open]);
 
-  const isActivelySyncing = isSavingOnline || uploadingPhotoCount > 0;
+  const isBackgroundSyncActive = Boolean(backgroundSync?.active);
+  const bgTotal = backgroundSync?.totalQueued ?? 0;
+  const bgCurrent = Math.min(bgTotal, (backgroundSync?.completed ?? 0) + 1);
+  const queuedPhotoSyncCount =
+    failedPhotoCount + localOnlyPhotoCount + queuedOtherReportsPhotoCount;
+
+  const isActivelySyncing =
+    isBackgroundSyncActive || isSavingOnline || uploadingPhotoCount > 0;
   const hasPendingOnlineWork =
-    isSignedIn && (hasUnsavedCloudChanges || localOnlyPhotoCount > 0);
+    isSignedIn &&
+    (hasUnsavedCloudChanges ||
+      localOnlyPhotoCount > 0 ||
+      queuedOtherReportsPhotoCount > 0);
+
+  const hasSaveError = Boolean(isSignedIn && hasUnsavedCloudChanges && lastSaveError);
 
   let tone: VisualStatusTone = 'green';
   let shortLabel = isSignedIn ? 'Synced' : 'Online';
@@ -181,6 +230,13 @@ export function NetworkStatusIndicator({
     tone = 'amber';
     shortLabel = 'Offline';
     headline = 'Offline · Saving locally';
+  } else if (isBackgroundSyncActive) {
+    tone = 'amber';
+    shortLabel = bgTotal > 0 ? `Bg Sync ${bgCurrent}/${bgTotal}` : 'Bg Sync…';
+    headline =
+      bgTotal > 0
+        ? `Background sync retrying photo ${bgCurrent} of ${bgTotal}…`
+        : 'Background sync active…';
   } else if (isActivelySyncing) {
     tone = 'amber';
     shortLabel =
@@ -193,6 +249,10 @@ export function NetworkStatusIndicator({
         : uploadingPhotoCount > 0
           ? `Uploading ${uploadingPhotoCount} ${uploadingPhotoCount === 1 ? 'photo' : 'photos'} to cloud…`
           : 'Saving report to database…';
+  } else if (hasSaveError) {
+    tone = 'red';
+    shortLabel = 'Save Failed';
+    headline = 'Database save failed · Retrying';
   } else if (failedPhotoCount > 0) {
     tone = 'red';
     shortLabel = `${failedPhotoCount} Failed`;
@@ -239,7 +299,11 @@ export function NetworkStatusIndicator({
         aria-haspopup="dialog"
         aria-label={`Network and sync status: ${headline}`}
         title={headline}
-        className="inline-flex items-center gap-2 h-9 px-2.5 rounded-lg text-xs font-medium hover:bg-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-700/30 transition-colors whitespace-nowrap shrink-0"
+        className={`inline-flex items-center gap-2 h-9 px-2.5 rounded-lg text-xs font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-700/30 transition-colors whitespace-nowrap shrink-0 ${
+          isBackgroundSyncActive
+            ? 'bg-amber-50 border border-amber-200 hover:bg-amber-100/80'
+            : 'hover:bg-slate-100'
+        }`}
       >
         <span className="relative flex h-2.5 w-2.5 shrink-0 items-center justify-center">
           {isActivelySyncing && (
@@ -252,11 +316,15 @@ export function NetworkStatusIndicator({
 
         {!isConnected ? (
           <WifiOff className={`w-3.5 h-3.5 shrink-0 ${textClass}`} />
+        ) : isBackgroundSyncActive ? (
+          <RefreshCw
+            className={`w-3.5 h-3.5 shrink-0 animate-spin ${textClass}`}
+          />
         ) : isActivelySyncing ? (
           <Loader2
             className={`w-3.5 h-3.5 shrink-0 animate-spin ${textClass}`}
           />
-        ) : failedPhotoCount > 0 ? (
+        ) : hasSaveError || failedPhotoCount > 0 ? (
           <AlertTriangle className={`w-3.5 h-3.5 shrink-0 ${textClass}`} />
         ) : (
           <Wifi className={`w-3.5 h-3.5 shrink-0 ${textClass}`} />
@@ -291,11 +359,13 @@ export function NetworkStatusIndicator({
                   ? 'Edits and photos are safely stored locally on this device and can be synced once your connection returns.'
                   : isActivelySyncing
                     ? 'Active uploads or database saves are currently transferring. Keep this tab open until syncing finishes.'
-                    : failedPhotoCount > 0
-                      ? 'One or more photo proofs failed to upload online. They remain saved locally and can be retried now.'
-                      : isSignedIn
-                        ? 'Connected to the network. Photos upload immediately when attached and reports save online to Firestore.'
-                        : 'Connected to the network. Sign in with Google to sync reports and photo proofs online.'}
+                    : hasSaveError
+                      ? 'Your latest edits are safe locally on this device, but syncing to Cloud Firestore hit an error. Tap Retry Save Now.'
+                      : failedPhotoCount > 0
+                        ? 'One or more photo proofs failed to upload online. They remain saved locally and can be retried now.'
+                        : isSignedIn
+                          ? 'Connected to the network. Photos upload immediately when attached and reports save online to Firestore.'
+                          : 'Connected to the network. Sign in with Google to sync reports and photo proofs online.'}
               </p>
             </div>
           </div>
@@ -324,31 +394,47 @@ export function NetworkStatusIndicator({
               </span>
             </div>
 
-            <div className="pt-2.5 flex items-center justify-between gap-2">
-              <span className="text-slate-500 flex items-center gap-1.5">
-                {isSignedIn ? (
-                  <Cloud className="w-3.5 h-3.5 text-slate-500" />
-                ) : (
-                  <CloudOff className="w-3.5 h-3.5 text-slate-400" />
-                )}
-                Database Save
-              </span>
-              <span className="font-medium text-slate-800 tabular-nums">
-                {isSavingOnline ? (
-                  <span className="text-amber-700 font-semibold">Saving…</span>
-                ) : !isSignedIn ? (
-                  <span className="text-slate-500">Local only</span>
-                ) : hasUnsavedCloudChanges ? (
-                  <span className="text-amber-700 font-semibold">
-                    Unsaved edits
-                  </span>
-                ) : (
-                  <span className="text-emerald-700 font-semibold inline-flex items-center gap-1">
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    Synced
-                  </span>
-                )}
-              </span>
+            <div className="pt-2.5 space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-slate-500 flex items-center gap-1.5">
+                  {isSignedIn ? (
+                    <Cloud className="w-3.5 h-3.5 text-slate-500" />
+                  ) : (
+                    <CloudOff className="w-3.5 h-3.5 text-slate-400" />
+                  )}
+                  Database Save
+                </span>
+                <span className="font-medium text-slate-800 tabular-nums">
+                  {isSavingOnline ? (
+                    <span className="text-amber-700 font-semibold">Saving…</span>
+                  ) : !isSignedIn ? (
+                    <span className="text-slate-500">Local only</span>
+                  ) : hasSaveError ? (
+                    <span className="text-red-700 font-semibold">
+                      Save failed
+                    </span>
+                  ) : hasUnsavedCloudChanges ? (
+                    <span className="text-amber-700 font-semibold">
+                      Unsaved edits
+                    </span>
+                  ) : (
+                    <span className="text-emerald-700 font-semibold inline-flex items-center gap-1">
+                      <CheckCircle2 className="w-3.5 h-3.5" />
+                      Synced
+                    </span>
+                  )}
+                </span>
+              </div>
+              {hasSaveError && lastSaveError && (
+                <div className="rounded-md bg-red-50 border border-red-200 px-2.5 py-1.5 text-[11px] text-red-800 leading-snug">
+                  <div className="font-semibold">{lastSaveError.summary}</div>
+                  {lastSaveError.code && (
+                    <div className="font-mono text-[10px] text-red-600 mt-0.5 truncate">
+                      {lastSaveError.code}
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="pt-2.5 flex items-center justify-between gap-2">
@@ -381,6 +467,29 @@ export function NetworkStatusIndicator({
             </div>
 
             <div className="pt-2.5 flex items-center justify-between gap-2 text-[11px] text-slate-500">
+              <span>Background Sync</span>
+              <span className="font-mono tabular-nums">
+                {isBackgroundSyncActive ? (
+                  <span className="text-amber-700 font-semibold">
+                    Retrying {bgCurrent}/{bgTotal}…
+                  </span>
+                ) : !isConnected && queuedPhotoSyncCount > 0 ? (
+                  <span className="text-amber-700 font-medium">
+                    Queued ({queuedPhotoSyncCount}) · Waiting
+                  </span>
+                ) : queuedPhotoSyncCount > 0 && isSignedIn ? (
+                  <span className="text-amber-700 font-medium">
+                    {queuedPhotoSyncCount} pending
+                  </span>
+                ) : (
+                  <span className="text-emerald-700 font-medium">
+                    Ready · Listening
+                  </span>
+                )}
+              </span>
+            </div>
+
+            <div className="pt-2.5 flex items-center justify-between gap-2 text-[11px] text-slate-500">
               <span>Auto-save</span>
               {onToggleAutoSave ? (
                 <button
@@ -407,6 +516,34 @@ export function NetworkStatusIndicator({
             </div>
 
             <div className="pt-2.5 flex items-center justify-between gap-2 text-[11px] text-slate-500">
+              <span>Photo Quality</span>
+              {onToggleHdUploads ? (
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={hdUploadsEnabled}
+                  onClick={() => onToggleHdUploads(!hdUploadsEnabled)}
+                  className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded font-semibold transition-colors ${
+                    hdUploadsEnabled
+                      ? 'bg-emerald-50 text-emerald-700 hover:bg-emerald-100'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  <span
+                    className={`w-1.5 h-1.5 rounded-full ${
+                      hdUploadsEnabled ? 'bg-emerald-500' : 'bg-slate-400'
+                    }`}
+                  />
+                  {hdUploadsEnabled ? 'HD (1920px)' : 'Standard'}
+                </button>
+              ) : (
+                <span className="font-semibold text-emerald-700">
+                  HD (1920px)
+                </span>
+              )}
+            </div>
+
+            <div className="pt-2.5 flex items-center justify-between gap-2 text-[11px] text-slate-500">
               <span>Last synced</span>
               <span className="font-mono tabular-nums text-slate-700">
                 {formatTime(lastSyncedAt)}
@@ -428,17 +565,41 @@ export function NetworkStatusIndicator({
               {isChecking ? 'Checking…' : 'Check Now'}
             </button>
 
-            {failedPhotoCount > 0 && isSignedIn && isConnected ? (
+            {hasSaveError && isConnected ? (
               <button
                 type="button"
+                disabled={isSavingOnline}
+                onClick={() => {
+                  setOpen(false);
+                  void onSaveOnline();
+                }}
+                className="inline-flex items-center gap-1.5 px-3 h-8 text-[11.5px] font-semibold text-white bg-red-700 hover:bg-red-800 disabled:opacity-50 rounded-md transition-colors whitespace-nowrap"
+              >
+                <RefreshCw className={`w-3 h-3 ${isSavingOnline ? 'animate-spin' : ''}`} />
+                Retry Save Now
+              </button>
+            ) : queuedPhotoSyncCount > 0 && isSignedIn && isConnected ? (
+              <button
+                type="button"
+                disabled={isBackgroundSyncActive}
                 onClick={() => {
                   onRetryFailedPhotos();
                   setOpen(false);
                 }}
-                className="inline-flex items-center gap-1.5 px-3 h-8 text-[11.5px] font-semibold text-white bg-red-700 hover:bg-red-800 rounded-md transition-colors whitespace-nowrap"
+                className={`inline-flex items-center gap-1.5 px-3 h-8 text-[11.5px] font-semibold text-white disabled:opacity-60 rounded-md transition-colors whitespace-nowrap ${
+                  failedPhotoCount > 0
+                    ? 'bg-red-700 hover:bg-red-800'
+                    : 'bg-slate-900 hover:bg-slate-800'
+                }`}
               >
-                <RefreshCw className="w-3 h-3" />
-                Retry Failed ({failedPhotoCount})
+                <RefreshCw
+                  className={`w-3 h-3 ${isBackgroundSyncActive ? 'animate-spin' : ''}`}
+                />
+                {isBackgroundSyncActive
+                  ? 'Syncing…'
+                  : failedPhotoCount > 0
+                    ? `Retry Sync (${queuedPhotoSyncCount})`
+                    : `Sync Photos (${queuedPhotoSyncCount})`}
               </button>
             ) : !isSignedIn ? (
               <button

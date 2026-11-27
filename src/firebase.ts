@@ -11,10 +11,28 @@ import {
   getDocFromServer,
   getFirestore,
   initializeFirestore,
+  memoryLocalCache,
 } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
 export const GMAIL_SEND_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
+const PUBLIC_INSPECTOR_ID_KEY = 'iqaf005_public_inspector_id';
+
+export function getOrCreatePublicInspectorId(): string {
+  try {
+    const existing = localStorage.getItem(PUBLIC_INSPECTOR_ID_KEY);
+    if (existing && /^[a-zA-Z0-9_-]{4,128}$/.test(existing)) {
+      return existing;
+    }
+    const generated = `public-${Date.now().toString(36)}-${Math.random()
+      .toString(36)
+      .slice(2, 10)}`;
+    localStorage.setItem(PUBLIC_INSPECTOR_ID_KEY, generated);
+    return generated;
+  } catch {
+    return 'public-inspector';
+  }
+}
 
 const config = firebaseConfig as typeof firebaseConfig & {
   firestoreDatabaseId?: string;
@@ -25,13 +43,28 @@ export const db = (() => {
   try {
     return initializeFirestore(
       app,
-      { experimentalAutoDetectLongPolling: true },
+      {
+        experimentalAutoDetectLongPolling: true,
+        ignoreUndefinedProperties: true,
+        localCache: memoryLocalCache(),
+      },
       config.firestoreDatabaseId
     );
   } catch {
-    return config.firestoreDatabaseId
-      ? getFirestore(app, config.firestoreDatabaseId)
-      : getFirestore(app);
+    try {
+      return initializeFirestore(
+        app,
+        {
+          experimentalAutoDetectLongPolling: true,
+          ignoreUndefinedProperties: true,
+        },
+        config.firestoreDatabaseId
+      );
+    } catch {
+      return config.firestoreDatabaseId
+        ? getFirestore(app, config.firestoreDatabaseId)
+        : getFirestore(app);
+    }
   }
 })();
 export const auth = getAuth(app);
@@ -139,7 +172,12 @@ function inferCodeFromMessage(message: string): string {
   if (lower.includes('aborted') || lower.includes('canceled')) {
     return 'canceled';
   }
-  if (lower.includes('600 kb') || lower.includes('storage limits')) {
+  if (
+    lower.includes('600 kb') ||
+    lower.includes('920 kb') ||
+    lower.includes('storage limits') ||
+    lower.includes('hd storage limit')
+  ) {
     return 'client/payload-too-large';
   }
   if (lower.includes('invalid or corrupted image')) {
@@ -162,7 +200,7 @@ function describeFirebaseErrorCode(code: string): {
       return {
         friendlySummary: 'Permission denied',
         guidance:
-          'Verify you are signed in with a verified Google account and that Firestore/Storage security rules allow writes to this report path.',
+          'Verify you are signed in with Google and have Owner or Editor access to this inspection report in Cloud Firestore.',
         retryable: false,
       };
     case 'storage/unauthenticated':
@@ -178,7 +216,7 @@ function describeFirebaseErrorCode(code: string): {
       return {
         friendlySummary: 'Cloud quota exceeded',
         guidance:
-          'Daily Firebase storage or Firestore write quota has been reached. Your photo remains safely cached locally and can be synced once quota resets.',
+          'Daily Cloud Firestore write quota has been reached. Your photo remains safely cached locally and can be synced once quota resets.',
         retryable: false,
       };
     case 'storage/retry-limit-exceeded':
@@ -220,7 +258,7 @@ function describeFirebaseErrorCode(code: string): {
       return {
         friendlySummary: 'Firebase configuration issue',
         guidance:
-          'The configured Firebase project, database, or bucket rejected the precondition. Verify Firebase project setup and deployed rules.',
+          'The configured Cloud Firestore database rejected the precondition. Verify the Firebase project setup and deployed Firestore rules.',
         retryable: false,
       };
     case 'client/payload-too-large':
@@ -228,7 +266,7 @@ function describeFirebaseErrorCode(code: string): {
       return {
         friendlySummary: 'Photo payload rejected',
         guidance:
-          'The photo exceeded the 600 KB document payload limit or contained an invalid field value. Try capturing at lower resolution.',
+          'The photo exceeded the 920 KB HD document payload limit or contained an invalid field value. Try switching HD off or re-capturing.',
         retryable: false,
       };
     case 'unavailable':
