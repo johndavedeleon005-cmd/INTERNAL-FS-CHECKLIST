@@ -18,6 +18,7 @@ import {
   LayoutDashboard,
   Link2,
   Loader2,
+  Lock,
   LogIn,
   LogOut,
   Mail,
@@ -148,6 +149,7 @@ import { OfflineShellHeaderBanner } from './components/OfflineShellHeaderBanner'
 import { PhotoLightbox } from './components/PhotoLightbox';
 import { PhotoUploadDiagnosticOverlay } from './components/PhotoUploadDiagnosticOverlay';
 import { PhotoVaultView } from './components/PhotoVaultView';
+import { PinCodeGateScreen } from './components/PinCodeGateScreen';
 import { ReportPreview } from './components/ReportPreview';
 import {
   type MergedReportSelectionItem,
@@ -196,6 +198,33 @@ function formatRelativeTime(
 }
 
 export default function App() {
+  // Site PIN Access Gate (JN - 1010)
+  const [isPinUnlocked, setIsPinUnlocked] = useState<boolean>(() => {
+    try {
+      return sessionStorage.getItem('iqaf005_pin_unlocked_v1') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const handleUnlockPin = useCallback(() => {
+    setIsPinUnlocked(true);
+    try {
+      sessionStorage.setItem('iqaf005_pin_unlocked_v1', 'true');
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
+  const handleLockPin = useCallback(() => {
+    setIsPinUnlocked(false);
+    try {
+      sessionStorage.removeItem('iqaf005_pin_unlocked_v1');
+    } catch {
+      // ignore storage errors
+    }
+  }, []);
+
   // Auth & Online Cloud state
   const [user, setUser] = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
@@ -3895,6 +3924,20 @@ export default function App() {
             </button>
           </div>
         )}
+        <div className="mt-2 pt-2 border-t border-slate-200/80 flex items-center justify-between">
+          <span className="font-mono text-[10px] font-semibold text-slate-500">
+            PIN: JN - ****
+          </span>
+          <button
+            type="button"
+            onClick={handleLockPin}
+            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-slate-600 hover:text-red-700 hover:bg-red-50 rounded transition-colors cursor-pointer"
+            title="Lock site with JN PIN code"
+          >
+            <Lock className="w-3 h-3" />
+            <span>Lock Site</span>
+          </button>
+        </div>
       </div>
 
       {/* Progress summary */}
@@ -4192,6 +4235,26 @@ export default function App() {
         )}
       </div>
     ) : null;
+
+  if (!isPinUnlocked) {
+    return (
+      <>
+        {isRunningFromOfflineCache && (
+          <header className="no-print sticky top-0 z-40">
+            <OfflineShellHeaderBanner
+              isNetworkOffline={isNetworkOffline}
+              updateAvailable={appShellSnapshot.updateAvailable}
+              isChecking={isCheckingAppUpdates}
+              statusNote={shellUpdateNote}
+              onCheckForUpdates={() => void handleCheckForAppUpdates()}
+            />
+          </header>
+        )}
+        <PinCodeGateScreen onUnlock={handleUnlockPin} />
+        {bottomRightToastStack}
+      </>
+    );
+  }
 
   if (!authReady) {
     return (
